@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Resource lease",
+    "description": "Arbitrates browsers, fixed ports, screen focus, and shared write targets between agents with TTL leases on lock files shared with the resource-lease CLI."
+  }
+}

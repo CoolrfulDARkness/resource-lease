@@ -1,0 +1,22 @@
+# dsh-resource-lease -- Host-only bundle.
+#
+# One row inserts the plugin. Every config field is optional: the plugin's
+# Config schema supplies the defaults, and the commented block below lists the
+# knobs. Uncomment only what you actually need to change.
+- insert:
+    - id: resource-lease
+      name: dsh-resource-lease
+      config:
+        enabled: true
+        # lockRoot: 'D:\resource-locks'   # default: %LOCALAPPDATA%\dsh-resource-lease\locks
+        #                                 # (or DSH_RESOURCE_LOCK_ROOT). The CLI must use the same one.
+        # defaultTtlMs: 30000           # lease lifetime when the caller omits ttlMs
+        # maxWaitMs: 120000             # how long one acquire may wait
+        # onTimeout: fail               # fail | queue | steal
+        # resources:                    # default arbitration per resource key
+        #   'browser:chromium': { mode: pool, slots: 2 }
+        #   'browser:profile:main': { mode: exclusive }
+        #   'port:9222': { mode: exclusive }
+        #   'screen:focus': { mode: exclusive }
+        # protectedTools:               # tool name -> resource that must be held
+        #   pwsh: 'screen:focus'

@@ -1,0 +1,65 @@
+{
+  "name": "dsh-resource-lease",
+  "version": "0.1.0",
+  "description": "Resource lease arbitration for agents sharing one machine: a Host service, three tools, runtime context and a tool guard, on lock files shared with the resource-lease CLI.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/lock.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "PUBLISH.md",
+    "test/*.test.js"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check lib/index.js && node --check lib/lock.js && node --check test/release-after-takeover.test.js",
+    "prepublishOnly": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoolrfulDARkness/resource-lease.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/CoolrfulDARkness/resource-lease#readme",
+  "bugs": {
+    "url": "https://github.com/CoolrfulDARkness/resource-lease/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "resource-lock",
+    "lease",
+    "multi-agent",
+    "concurrency",
+    "mutual-exclusion",
+    "file-lock",
+    "browser-lock",
+    "agent-coordination"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "manifestVersion": 1
+  },
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ]
+}

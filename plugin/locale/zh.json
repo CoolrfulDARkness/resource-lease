@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "资源租约",
+    "description": "用带 TTL 的租约在多个 agent 之间仲裁浏览器、固定端口、屏幕焦点和共享写目标;锁文件与 resource-lease CLI 共用,两边互相排斥。"
+  }
+}

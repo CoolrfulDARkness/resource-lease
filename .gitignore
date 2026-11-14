@@ -1,0 +1,7 @@
+# Staging rules for the published tree -- see STAGING.md.
+#
+# review/ holds the adversarial-review evidence. It deliberately keeps the raw
+# pre-redaction strings so the findings can be checked, which is exactly why it
+# must never travel with the published tree. Do not delete those files; exclude
+# them from every tag, push and staging copy.
+review/

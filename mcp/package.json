@@ -1,0 +1,38 @@
+{
+  "name": "resource-lease-mcp",
+  "version": "1.0.0",
+  "description": "Zero-dependency MCP server that arbitrates exclusive machine resources (browsers, fixed ports, screen focus, shared write targets) between agents, using file leases that are byte-compatible with the resource-lease CLI.",
+  "type": "module",
+  "bin": {
+    "resource-lease-mcp": "./resource-lease-mcp.mjs"
+  },
+  "main": "./resource-lease-mcp.mjs",
+  "exports": "./resource-lease-mcp.mjs",
+  "files": [
+    "resource-lease-mcp.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node resource-lease-mcp.mjs",
+    "test": "node test/run-all.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "resource-lock",
+    "lease",
+    "mutual-exclusion",
+    "multi-agent",
+    "agents"
+  ],
+  "license": "MIT",
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ]
+}
