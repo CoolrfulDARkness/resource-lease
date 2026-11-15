@@ -27,12 +27,23 @@
     "lease",
     "mutual-exclusion",
     "multi-agent",
-    "agents"
+    "agents",
+    "concurrency",
+    "browser-automation"
   ],
   "license": "MIT",
   "os": [
     "win32",
     "darwin",
     "linux"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoolrfulDARkness/resource-lease.git",
+    "directory": "mcp"
+  },
+  "homepage": "https://github.com/CoolrfulDARkness/resource-lease/tree/main/mcp#readme",
+  "bugs": {
+    "url": "https://github.com/CoolrfulDARkness/resource-lease/issues"
+  }
 }
