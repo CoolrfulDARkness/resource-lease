@@ -57,7 +57,7 @@
 
 ## 4. 两类互斥 + 一个容量维度
 
-三类冲突形态要用三种**取值**表达:两个互斥模式(`exclusive` / `shared`)+ 一个容量模式(`pool`)。少一种就有表达不了的场景。
+取值有两个在用的:互斥模式 `exclusive`、容量模式 `pool`。`shared` 是**预留取值**,当前没有独立语义(见本节末)。
 
 | 类型 | 例子 | 模式 | 冲突形态 |
 |---|---|---|---|
@@ -65,7 +65,7 @@
 | **B 容量** | CPU/内存/GPU、浏览器实例数、API 速率、并发连接 | `pool(slots: N)` | 不失败,退化成慢 → 超时 → OOM |
 | **C 共享可变状态** | 同一份工作区文件、git index、数据库、构建缓存 | `exclusive` + 路径前缀键 | 静默污染:成功返回但结果错 |
 
-`shared`(多读者)是第三种取值,**但还没有独立语义**:参考实现里它与 `exclusive` 行为完全相同(同样只允许一个持有者),因为还没遇到真实需要的场景,不猜着实现。要表达 C 类资源,用 `exclusive` + 路径前缀键。
+`shared`(多读者)是**预留的第三种取值,当前无独立语义**:参考实现里它与 `exclusive` 行为完全相同(同样只允许一个持有者),因为还没遇到真实需要的场景,不猜着实现。要表达 C 类资源,用 `exclusive` + 路径前缀键。
 
 **B 类最容易被漏掉。** N 个 agent 各起一次无头浏览器,谁也不"占锁",但会把内存/CPU 打满、把工具超时撑爆。没有 `pool`,这个病根本表达不出来。
 
@@ -83,15 +83,21 @@ $LEASE   = "./cli/lease.ps1"
 $ME      = "<你的 agent 名>"          # 由派活方注入更好
 
 # 1) 申请。抢不到就退出码 2,别硬闯。
-& $LEASE acquire browser:profile:main -Ttl 5m -Wait 120s -Owner $ME -Reason "导出报表截图"
-if ($LASTEXITCODE -ne 0) { Write-Output "BLOCKED: browser:profile:main 被占用,已上报"; exit 2 }
+#    不给 -Wait:默认 -Wait 0,立刻失败(铁律一)。要排队才显式给,见 §5 末尾。
+$lease = (& $LEASE acquire browser:profile:main -Ttl 5m -Owner $ME -Reason "导出报表截图" | ConvertFrom-Json)
+if ($LASTEXITCODE -ne 0 -or -not $lease.id) {
+    Write-Output "BLOCKED: browser:profile:main 被占用,已上报"
+    exit 2
+}
 
 # 2) 干活
 try {
     node render.mjs
 } finally {
-    # 3) 释放。异常路径也必须释放。
-    & $LEASE release --all -Owner $ME
+    # 3) 只释放自己这一张租约。
+    #    不要用 `release --all -Owner $ME`:同一个 agent 往往同时持有多个资源
+    #    (浏览器 + 目录 + 端口),--all 会把别的步骤正在用的那些一起放掉。
+    & $LEASE release $lease.id
 }
 ```
 
@@ -123,7 +129,18 @@ try {
  "params":{"name":"resource_release","arguments":{"id":"lz_7f3a1b2c3d4e"}}}
 ```
 
-`ttlMs` / `waitMs` 接受数字毫秒,也接受 `"5m"` / `"30s"` 这种字符串(schema 里是 `oneOf: [number, string]`)。
+**时长怎么写(`-Ttl` / `-Wait` 与 `ttlMs` / `waitMs` 是同一套规则,CLI 与 MCP 一致):**
+
+| 写法 | 含义 |
+|---|---|
+| 数字(JSON 里的 `number`,如 `"ttlMs": 30000`) | **毫秒** |
+| 带单位的字符串:`"500ms"` / `"30s"` / `"2m"` / `"1h"` | 按单位 |
+| 字符串里的裸数字(如 `"600"`、`DSH_RESOURCE_TTL=600`、CLI 的 `-Ttl 600`) | **秒** |
+
+- 裸数字字符串按**秒**读,有两个原因:环境变量恒为字符串;而且对锁来说读长了比读短了安全 —— TTL 读短会让租约提前过期被别人接管,于是一把锁有两个持有者。
+- 解析不了的时长是**硬报错**,不静默回落到默认值:CLI 退 3;MCP 侧作为工具调用失败返回 `isError: true`;而 `DSH_RESOURCE_TTL` 写错会让 server 启动即失败。这样手误不会变成"锁提前过期"。
+- TTL 下限 **1000ms**:低于此值会被抬到 1000ms(0 会让 `expiresAt == createdAt`,等于没锁)。
+- MCP 侧 schema 里这两个字段是 `oneOf: [number, string]`,所以做严格校验的客户端不会在发出前拒掉字符串。
 
 MCP server 与 CLI 指向同一个锁目录时互相排斥。两者必须是同一套锁文件格式,否则"用 MCP 的 agent"和"用 CLI 的 agent"看不见对方,仲裁等于没有。
 
@@ -188,7 +205,7 @@ BLOCKED on browser:profile:main
 | "我 headless 跑,不用管" | headless 只是没有焦点问题;profile 锁、端口、内存/CPU 照样冲突。 |
 | "我每次用临时 profile,所以不冲突" | 不撞锁,但撞**容量**。N 个浏览器进程同时起会打爆内存和工具超时。这正是 `pool` 要解决的。 |
 | "抢不到等一下就好了" | 只有调用方显式选 `-Wait` 才等。`acquire` 与 `run` 默认**立即失败**,把决策权留给编排者。 |
-| "锁只要拿一次,以后都不用管" | 租约带 TTL。跑超过 TTL 的长任务,要么给足 `-Ttl`,要么中途续期。 |
+| "锁只要拿一次,以后都不用管" | 租约带 TTL。跑超过 TTL 的长任务,给足 `-Ttl`(按预期耗时留余量)。**没有"续期"这个操作**:工具只有 acquire / status / release(见 §5、§10),lease 拿在手里不会自动延长。 |
 | "在群里说一声我要用浏览器就行" | 声明不可强制。没有任何东西阻止第二个 agent 直接连上去。见 [CASE-STUDIES.md](CASE-STUDIES.md)。 |
 | "再试一次说不定就好了" | 违反铁律一。资源冲突不会因为重试而消失,只会变贵。 |
 

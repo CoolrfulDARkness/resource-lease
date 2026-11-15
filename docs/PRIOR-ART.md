@@ -31,7 +31,7 @@
 
 ## 本方案相对差异(不主张首创,只列差异)
 
-1. **键盘与屏幕焦点被当成资源键。** `screen:focus` —— headless 场景不存在这个问题,所以现有生态没有动力做。这是 headed 场景的长尾。
+1. **键盘与屏幕焦点被当成资源键。** `screen:focus` —— headless 场景不存在这个问题;在我检索到的方案里没有把它当资源键(检索范围与方式见上)。这是 headed 场景的长尾。
 2. **资源键是跨工具的公共词汇,不是某个工具的私有参数。** 端口、profile、目录、焦点、API 配额走同一套 `<类别>:<具体>` 命名,所以不同工具、不同框架的 agent 能互相排斥。
 3. **`pool` 与 `exclusive` 同级。** 多数方案只处理"锁",不处理"容量"。而"各起一个无头浏览器、谁也不占锁但把机器拖垮"是纯容量问题,用锁表达不出来。
 4. **可见性优先于隔离。** 占用状态注入到编排者的上下文里,冲突在开工前就可见。多数方案只做事前阻断或事后观测,不做"让人看见"。
@@ -39,7 +39,7 @@
 
 ## 明确不声称的
 
-- 不声称"首个"。上面第 6 行那个 30 秒过期的文件锁,机制上就是我们要的答案的大半。
+- 不声称"首个"。上表第 14 行那个 30 秒过期的文件锁,机制上就是我们要的答案的大半。
 - 不声称"解决多 agent 资源争用"。**我们只做单机、多进程、显式声明**。跨机器、优先级抢占、自动资源推断都不做。
 - **没有做死锁检测。** 两个 agent 各持一把锁、又互相等对方那把,本方案会双双等到超时失败 —— 结果是失败而不是卡死,但这是降级方案,不是解法。Wait-For 图那一套是已知的正确做法,留给 v2。
-- 上游明确拒收过这类需求:[microsoft/playwright-mcp#1466](https://github.com/microsoft/playwright-mcp/issues/1466),维护者 pavelfeldman 的原话是 "I'll close this as out of scope. Please use `--isolated` + http mode or playwright cli for scale"。**这套东西只能做在宿主层或旁路层。**
+- 上游明确拒收过这类需求:[microsoft/playwright-mcp#1466](https://github.com/microsoft/playwright-mcp/issues/1466),维护者 pavelfeldman 的原话是 "I'll close this as out of scope. Please use `--isolated` + http mode or playwright cli for scale"。playwright-mcp 已明确不做;因此这类能力只能由**宿主、旁路或独立 broker** 提供(本仓库取第三种)。

@@ -9,7 +9,7 @@ publish/mcp/
 ├─ resource-lease-mcp.mjs   单文件实现(约 1200 行,只用 node: 内建模块)
 ├─ package.json             bin: resource-lease-mcp, "type": "module"
 ├─ README.md
-└─ test/                    协议 / 互斥 / 跨工具 / TTL 四组测试
+└─ test/                    协议 / 互斥 / 跨工具 / TTL / 接管 五组测试
 ```
 
 ## 环境要求
@@ -46,7 +46,7 @@ claude mcp add resource-lease -- node ./mcp/resource-lease-mcp.mjs
       "args": [
         "./mcp/resource-lease-mcp.mjs",
         "--lock-root",
-        "C:\\Users\\<you>\\AppData\\Local\\resource-lease\\locks"
+        "C:\\Users\\<you>\\AppData\\Local\\dsh-resource-lease\\locks"
       ]
     }
   }
@@ -66,7 +66,7 @@ claude mcp add resource-lease -- node ./mcp/resource-lease-mcp.mjs
         "./mcp/resource-lease-mcp.mjs"
       ],
       "env": {
-        "DSH_RESOURCE_LOCK_ROOT": "C:\\Users\\<you>\\AppData\\Local\\resource-lease\\locks",
+        "DSH_RESOURCE_LOCK_ROOT": "C:\\Users\\<you>\\AppData\\Local\\dsh-resource-lease\\locks",
         "DSH_AGENT_NAME": "cursor-local"
       }
     }
@@ -76,7 +76,20 @@ claude mcp add resource-lease -- node ./mcp/resource-lease-mcp.mjs
 
 ### 3. 通用 `mcp.json`(Claude Desktop / Codex / 自研客户端)
 
-任何支持 stdio 传输的 MCP 客户端都吃这一段:
+任何支持 stdio 传输的 MCP 客户端都吃这一段。**这个包当前还没有发布到 npm**,所以 `npx -y resource-lease-mcp` 现在还拿不到 —— 先用 `command: node` + 绝对路径(下面第一个例子),发布之后再换成 `npx`。
+
+```json
+{
+  "mcpServers": {
+    "resource-lease": {
+      "command": "node",
+      "args": ["<path-to>/publish/mcp/resource-lease-mcp.mjs"]
+    }
+  }
+}
+```
+
+发布到 npm 之后可以简化成:
 
 ```json
 {
@@ -89,8 +102,7 @@ claude mcp add resource-lease -- node ./mcp/resource-lease-mcp.mjs
 }
 ```
 
-> `npx` 形式需要包已发布到 npm。**未发布**时请先 `npm i -g <path-to>/publish/mcp` 然后用
-> `"command": "resource-lease-mcp"`,或直接写 `node <绝对路径>`(见上面两种)。
+> 另一个不用发布的办法:`npm i -g <path-to>/publish/mcp`,然后 `"command": "resource-lease-mcp"`。
 > 路径建议用绝对路径:客户端的工作目录不一定是这个仓库。
 
 ## 三个工具
@@ -132,7 +144,7 @@ claude mcp add resource-lease -- node ./mcp/resource-lease-mcp.mjs
 }
 ```
 
-### 三种模式(照 DESIGN.md §3)
+### 三种模式(取值与取舍见 `docs/PROTOCOL.md` §4)
 
 | 模式 | 含义 | 典型资源 |
 |---|---|---|

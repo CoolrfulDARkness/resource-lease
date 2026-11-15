@@ -1,24 +1,27 @@
 # dsh-resource-lease
 
-> **这是一个 DSH(DeepSeek Harness)插件。** 它按 DSH bundle 的形态发布:`package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`,`icon` 指向插件图标——DSH 靠这两个字段识别 bundle,不要删。`lib/*.js` 不依赖任何 `@deepseek-ai/*` 包(原因见 §1.1),所以本地目录 / 符号链接安装都能装载。
->
-> 分发与收录(GitHub topic `dsh-plugin`、npm、社区 catalog index)见 [PUBLISH.md](./PUBLISH.md)。
-
 在**同一台机器上并行工作的多个 agent** 之间仲裁独占资源:浏览器 / Playwright、固定端口、屏幕与输入焦点、共享写目标。
 
 纯 Host 插件,纯 JS,无构建步骤,无 Client 端代码。
 
 它和零依赖的 `cli/lease.ps1` **共用同一套锁文件**,所以「用 CLI 的 agent」和「用插件的 agent」互相排斥——这是本插件存在的主要理由。
 
+它给模型加的是三样东西:**运行时上下文**(每个 step 注入"现在谁占着什么",没有任何租约时不输出任何文本)、**三个工具**(`resource_acquire` / `resource_release` / `resource_status`)、**工具守卫**(`protectedTools` 里登记的工具,未持租约调用直接被拒)。MCP server 与 CLI **都没有第一样** —— 那是本插件与它们的主要差异。
+
+> **这是 DSH(DeepSeek Harness)插件。** 它按 bundle 形态发布:`package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`、`icon` 指向插件图标,DSH 靠这两个字段识别 bundle,不要删。`lib/*.js` 不依赖任何 `@deepseek-ai/*` 包(原因见 §1.1),所以本地目录 / 符号链接安装都能装载。分发与收录见 [PUBLISH.md](./PUBLISH.md)。
+
 ## 安装
 
 ```bash
-# 1) npm 包(dshmarket 的一键安装走的就是这条路)
-npm i dsh-resource-lease
+# 首选:本地目录。在 DSH 的插件安装入口里指向 ./plugin
+# install_bundle 装出来是一个符号链接,所以插件必须自包含(§1.1)
+# 仓库里已经有它,不需要额外下载
+```
 
-# 2) 本地目录:在 DSH 的插件安装入口里指向 ./plugin
-#    本地目录安装即 install_bundle,装出来是一个符号链接,
-#    所以插件必须自包含(§1.1)
+```bash
+# 备选:npm 包(当前未发布到 npm registry)
+# 发布之后 dshmarket 的一键安装才会走这条路;在此之前下面的命令会 404
+npm i dsh-resource-lease
 ```
 
 装好后插件默认启用、默认配置即可工作;要改行为再动 `cordis.patch.yml`(§2)。
