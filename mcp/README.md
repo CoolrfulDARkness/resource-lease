@@ -251,8 +251,9 @@ $env:RL_KEEP='1'; node test\run-all.mjs   # 保留临时锁目录,便于失败�
 | `test/03-cross-tool.test.mjs` | MCP 拿锁 → `lease.ps1 status` 看得见 → `lease.ps1 acquire` 退出码 2;CLI 拿锁 → `resource_status` 看得见、MCP acquire 被拒;`lease.ps1 release <id>` 能释放 MCP 的租约;两边缺省锁根一致 |
 | `test/04-ttl.test.mjs` | 过期前仍互斥、过期后接管并归档 `.stale.`、`includeExpired`、TTL 下限、`"2s"` 字符串、`waitMs` 排队与超时、双向跨工具接管,以及「过期后旧 id 不得误删新持有者的锁」回归 |
 | `test/05-takeover.test.mjs` | 接管的安全性:读不到内容的锁文件**若是新文件**视为"正在写",绝不可抢(抢了就是一把锁两个持有者);**若是老文件**才按崩溃残留接管;同一规则 CLI 与 MCP 一致;TTL 只认 `expiresAt`,不认文件 mtime |
+| `test/06-release-fail-closed.test.mjs` | 释放的 fail-closed:锁文件能解析但**没有 string `id`** 时(`{}`、`{"id":123}`、`{"id":null}`、半截 JSON)一律**不删**,只记日志;精确 id 匹配才正常释放 —— 证明守卫不是"一律拒绝" |
 
-`ttlMs` / `waitMs` 在 schema 里声明为 `oneOf: [number, string]`:数字毫秒与 `"5m"`/`"30s"` 都合法,做严格 schema 校验的客户端不会在发出前把它拒掉。
+`ttlMs` / `waitMs` 在 schema 里声明为 `oneOf: [number, string]`:数字按**毫秒**;字符串带单位(`"500ms"` / `"30s"` / `"2m"`)按单位;字符串里的**裸数字按秒**(`"600"` = 600 秒,与 CLI 的 `-Ttl 600` 一致);解析不了是硬报错,不静默回落。所以做严格 schema 校验的客户端不会在发出前把字符串拒掉。
 
 ## 排障
 

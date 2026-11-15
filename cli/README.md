@@ -33,8 +33,9 @@ $LEASE = "./cli/lease.ps1"
 & $LEASE acquire browser:chromium -Ttl 5m -Wait 120s -Reason "导出报表截图"
 ```
 
-- `-Ttl` 默认 30s(或 `$DSH_RESOURCE_TTL`)。**长任务务必给足**,否则跑到一半锁被别人接管。
+- `-Ttl` 默认 30s(或 `$DSH_RESOURCE_TTL`)。**长任务务必给足**,否则跑到一半锁被别人接管。没有"续期"操作,lease 不会自动延长。
 - `-Wait` 默认 0(立即失败)。要排队就显式给。
+- 时长写法(`-Ttl` / `-Wait`,与 MCP 的 `ttlMs` / `waitMs` 同一套规则):数字是毫秒,带单位的字符串(`30s` / `500ms` / `2m`)按单位,**裸数字字符串(`"600"`、`-Ttl 600`)按秒**;解析不了直接退 3,TTL 下限 1000ms。详见 [docs/PROTOCOL.md](../docs/PROTOCOL.md) §5。
 - `-Owner` 不能为空:两个空 owner 无法区分,`release --all` 会互删租约,所以实现直接退 3。
 - `-Reason` 强烈建议填:主控和别的 agent 都靠它判断该等还是该改道。
 
