@@ -104,6 +104,69 @@ function ConvertTo-Lease($text) {
 
 Write-Host "Test root: $testRoot" -ForegroundColor Cyan
 
+# Scratch directory for the resource SUBJECTS (directories, ports). Kept
+# outside every lock root on purpose: a case root is a lock root, and a stray
+# directory in it would be mistaken for a squatter by the tests that count
+# *.lock files.
+$dataRoot = Join-Path $testRoot 'data'
+New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+
+# Mirror of the CLI's sanitizeKey (contract section 2), used to predict the
+# lock filename for a canonical facet: map everything outside [A-Za-z0-9._-] to
+# '_' and lowercase.
+function LockName([string]$facet) {
+  return (($facet -replace '[^A-Za-z0-9._-]', '_').ToLowerInvariant() + '.lock')
+}
+
+# The lease lock files of a root, excluding the acquire mutex (leading "_").
+function Get-LeaseFiles([string]$root) {
+  return @(Get-ChildItem $root -File -Filter '*.lock' -Force -ErrorAction SilentlyContinue |
+             Where-Object { -not $_.Name.StartsWith('_') })
+}
+
+function Write-RawLock([string]$path, $meta) {
+  [System.IO.File]::WriteAllText($path, ($meta | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Read-RawText([string]$path) {
+  try { return [System.IO.File]::ReadAllText($path) } catch { return '' }
+}
+
+function Get-NowMs { return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+
+function Get-SelfStartMs {
+  return [int64]([DateTimeOffset](Get-Process -Id $PID).StartTime).ToUnixTimeMilliseconds()
+}
+
+<#
+  Per-group cleanup safety net.
+
+  Several cases deliberately create a holder and leave it standing (to prove a
+  conflict names its owner, or that a live owner is not reclaimed). Every case
+  gets its OWN lock root, so a forgotten holder cannot leak into another case -
+  but it CAN fail a later assertion inside the SAME case, and then a test
+  scaffolding mistake looks exactly like a product bug. That happened once
+  already: a case kept a 60s lease alive and the next `run --keys` in the same
+  root was reported "Resource busy".
+
+  So every v2 case ends with this call. It deletes the case's lock files and
+  index records directly instead of going through `release --all` on purpose:
+  it must work even when the case deleted its index on purpose, and it must not
+  spawn one process per owner (the suite would get minutes slower).
+#>
+function Clear-CaseLeases {
+  $root = $env:DSH_RESOURCE_LOCK_ROOT
+  if (-not $root -or -not (Test-Path $root)) { return }
+  foreach ($f in (Get-LeaseFiles $root)) {
+    Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+  }
+  $idx = Join-Path $root '_leases'
+  if (Test-Path $idx) {
+    Get-ChildItem $idx -File -Filter '*.json' -ErrorAction SilentlyContinue |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # ------------------------------------------------------------------ 1. help
 Write-Host ''
 Write-Host '[1] help' -ForegroundColor Cyan
@@ -428,6 +491,408 @@ Check 'status now shows the NEW holder' ($out -match 'late-arrival') "out=$out"
 $r = Invoke-Cli @('acquire','dir:key','-Wait','0','-Owner','third-agent','-Ttl','30s')
 Check 'a later agent is blocked by the new holder, not by the directory' (($r.Code -eq 2) -and ($r.Err -match 'late-arrival')) "code=$($r.Code) err=$($r.Err)"
 $null = Invoke-Cli @('release','--all','-Owner','late-arrival')
+
+# ============================================================================
+# v2 CASES
+# The contract these cover is docs/RESOURCE-MODEL-v2.md: multi-key atomic
+# acquire (section 4), canonical form + facet conflicts (sections 2, 3),
+# liveness (section 5), CLI surface and exit codes (7.2, 7.3), and the test
+# matrix entries 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15 (section 11).
+# ============================================================================
+
+# ------------------------------- 21. multi-key acquire is one atomic lease
+Write-Host ''
+Write-Host '[21] multi-key acquire: two keys, one lease, two lock files' -ForegroundColor Cyan
+$root = New-CaseRoot 'multikey'
+$mkDir = Join-Path $dataRoot 'out'
+$r = Invoke-Cli @('acquire', "path:$mkDir", 'port:9222', '--ttl', '300s', '--reason', 'build', '-Owner', 'mk1')
+Check 'multi-key acquire exits 0' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$mkLease = ConvertTo-Lease $r.Out
+Check 'the lease covers both requested keys' ($mkLease -and @($mkLease.keys).Count -eq 2) "out=$($r.Out)"
+Check 'the lease covers two facets' ($mkLease -and @($mkLease.facets).Count -eq 2) ''
+Check 'the facets come out in orderKey order (path before port)' ($mkLease -and $mkLease.facets[0].StartsWith('path:') -and $mkLease.facets[1] -eq 'port:9222') "facets=$($mkLease.facets -join ',')"
+Check 'two lock files were created and both exist' ($mkLease -and @($mkLease.locks).Count -eq 2 -and @($mkLease.locks | Where-Object { -not (Test-Path $_ -PathType Leaf) }).Count -eq 0) ''
+Check 'the port facet has its own file' (Test-Path (Join-Path $root 'port_9222.lock') -PathType Leaf) ''
+Check 'the primary file is still sanitizeKey(canonicalKey)' ($mkLease -and (Test-Path (Join-Path $root (LockName $mkLease.facets[0])) -PathType Leaf)) ''
+Check 'the acquire mutex did not linger' (-not (Test-Path (Join-Path $root '_global.lock'))) ''
+$mkIndex = $null
+try { $mkIndex = [System.IO.File]::ReadAllText((Join-Path $root ("_leases\" + $mkLease.id + '.json'))) | ConvertFrom-Json } catch { }
+Check 'the aggregated index lists every facet file' ($mkIndex -and @($mkIndex.paths).Count -eq 2) "index=$($mkIndex | ConvertTo-Json -Compress)"
+Check 'the index also carries the v1 single-path field' ($mkIndex -and $mkIndex.path) ''
+$r = Invoke-Cli @('release', $mkLease.id)
+Check 'releasing the id frees every facet' ($r.Code -eq 0 -and @($mkLease.locks | Where-Object { Test-Path $_ }).Count -eq 0) "code=$($r.Code) err=$($r.Err)"
+Clear-CaseLeases
+
+# ------------------- 22. path ancestor conflicts, sibling prefixes do not
+Write-Host ''
+Write-Host '[22] path facets: ancestor conflicts, sibling prefix does not (matrix 2, 3)' -ForegroundColor Cyan
+$root = New-CaseRoot 'paths'
+$ancBase = Join-Path $dataRoot 'anc'
+$r = Invoke-Cli @('acquire', "path:$ancBase", '-Owner', 'ancA', '-Ttl', '60s', '-Reason', 'hold-out')
+Check 'holding a directory succeeds' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', "path:$ancBase\sub", '-Wait', '0', '-Owner', 'ancB')
+Check 'a descendant path conflicts (matrix 2)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'the conflict names the ancestor facet' ($r.Err -match 'path:c:') "err=$($r.Err)"
+Check 'the conflict names the ancestor holder' ($r.Err -match 'ancA') "err=$($r.Err)"
+$r = Invoke-Cli @('acquire', "path:${ancBase}2", '-Wait', '0', '-Owner', 'ancC', '-Ttl', '30s')
+Check 'a sibling with a shared string prefix does NOT conflict (matrix 3)' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Check 'the blocked descendant never created a file' ((Get-LeaseFiles $root).Count -eq 2) "files=$((Get-LeaseFiles $root).Count)"
+Clear-CaseLeases
+
+# ------------------------------------------- 23. port ranges overlap (matrix 5)
+Write-Host ''
+Write-Host '[23] port facets: range overlap (matrix 5)' -ForegroundColor Cyan
+$root = New-CaseRoot 'ports'
+$r = Invoke-Cli @('acquire', 'port:9220-9230', '-Owner', 'rangeHold', '-Ttl', '60s', '-Reason', 'wide')
+Check 'a port range acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', 'port:9222', '-Wait', '0', '-Owner', 'single')
+Check 'a port inside the held range conflicts (matrix 5)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$r = Invoke-Cli @('acquire', 'port:9230', '-Wait', '0', '-Owner', 'edge')
+Check 'the range boundary is inclusive' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$r = Invoke-Cli @('acquire', 'port:9300', '-Wait', '0', '-Owner', 'outside', '-Ttl', '30s')
+Check 'a port outside the range does not conflict' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Clear-CaseLeases
+
+# ------------------------------- 24. canonical form: spellings are one lock
+Write-Host ''
+Write-Host '[24] canonical form: different spellings hit the same lock' -ForegroundColor Cyan
+$root = New-CaseRoot 'canon'
+$canonDir = Join-Path $dataRoot 'Canon'
+$r = Invoke-Cli @('acquire', "path:$canonDir", '-Owner', 'c1', '-Ttl', '60s')
+Check 'a mixed-case path acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$canonLease = ConvertTo-Lease $r.Out
+Check 'the canonical path is lowercase with forward slashes' ($canonLease -and $canonLease.facets[0] -match '^path:c:/.*canon$') "facet=$($canonLease.facets[0])"
+$r = Invoke-Cli @('acquire', ("path:" + $canonDir.ToUpper() + '\'), '-Wait', '0', '-Owner', 'c2')
+Check 'uppercase + backslashes + trailing separator is the same lock' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$r = Invoke-Cli @('acquire', 'port:9222', '-Owner', 'p1', '-Ttl', '60s')
+Check 'port:9222 acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', 'port:09222', '-Wait', '0', '-Owner', 'p2')
+Check 'leading zeros in a port are normalized away' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'the normalized port named one file, not two' ((Test-Path (Join-Path $root 'port_9222.lock')) -and -not (Test-Path (Join-Path $root 'port_09222.lock'))) ''
+Clear-CaseLeases
+
+# ------------------------- 25. multi-key partial failure rolls back (matrix 7)
+Write-Host ''
+Write-Host '[25] multi-key partial failure: reverse rollback, no residue (matrix 7)' -ForegroundColor Cyan
+$root = New-CaseRoot 'rollback'
+$r = Invoke-Cli @('acquire', 'port:9421', '-Owner', 'blocker', '-Ttl', '60s', '-Reason', 'held')
+Check 'the blocker holds the port' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$blockerFile = Join-Path $root 'port_9421.lock'
+$blockerBefore = Read-RawText $blockerFile
+$rbDir = Join-Path $dataRoot 'rb'
+$r = Invoke-Cli @('acquire', "path:$rbDir", 'port:9421', '-Wait', '0', '-Owner', 'rollbacker', '-Reason', 'try')
+Check 'a multi-key acquire with one busy key exits 2' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$rbFiles = Get-LeaseFiles $root
+Check 'exactly one lock file remains: nothing was left behind' ($rbFiles.Count -eq 1 -and $rbFiles[0].Name -eq 'port_9421.lock') "files=$(($rbFiles | ForEach-Object { $_.Name }) -join ',')"
+Check 'the rollback is reported on stderr' ($r.Err -match 'Rolled back') "err=$($r.Err)"
+Check 'the rollback names the facet it released' ($r.Err -match 'path_') "err=$($r.Err)"
+Check 'the rollback ran in reverse order (the port is not in it)' (-not ($r.Err -match 'Rolled back.*port_9421')) "err=$($r.Err)"
+Check 'the blocking holder lock was not touched (matrix 15)' ((Read-RawText $blockerFile) -eq $blockerBefore) ''
+Check 'the conflict names the blocking facet and holder' (($r.Err -match 'port:9421') -and ($r.Err -match 'blocker')) "err=$($r.Err)"
+$rbIndexCount = @(Get-ChildItem (Join-Path $root '_leases') -File -Filter '*.json' -ErrorAction SilentlyContinue).Count
+Check 'the rolled-back attempt left no index record of its own' ($rbIndexCount -eq 1) "index records=$rbIndexCount"
+Clear-CaseLeases
+
+# ------------------------------ 26. the index is not the source of truth (13)
+Write-Host ''
+Write-Host '[26] deleting the index does not break exclusion (matrix 13)' -ForegroundColor Cyan
+$root = New-CaseRoot 'noindex'
+$niDir = Join-Path $dataRoot 'ni'
+$r = Invoke-Cli @('acquire', "path:$niDir", '-Owner', 'niA', '-Ttl', '60s', '-Reason', 'hold')
+Check 'the holder acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$niLease = ConvertTo-Lease $r.Out
+$niIndex = Join-Path $root ('_leases\' + $niLease.id + '.json')
+Check 'the index record exists before we delete it' (Test-Path $niIndex -PathType Leaf) ''
+Remove-Item $niIndex -Force -ErrorAction SilentlyContinue
+Check 'the index record is gone' (-not (Test-Path $niIndex)) ''
+$r = Invoke-Cli @('acquire', "path:$niDir", '-Wait', '0', '-Owner', 'niB')
+Check 'exclusion still holds without the index (matrix 13)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'status still reports the holder' ((Get-Status) -match 'niA') ''
+Check 'the facet lock file is still on disk' (@($niLease.locks | Where-Object { Test-Path $_ }).Count -eq 1) ''
+Remove-Item (Join-Path $root (LockName $niLease.facets[0])) -Force -ErrorAction SilentlyContinue
+Clear-CaseLeases
+
+# --------------------- 27. two processes race one path facet (matrix 1, G1)
+Write-Host ''
+Write-Host '[27] two processes race one path facet: exactly one wins (matrix 1)' -ForegroundColor Cyan
+$root = New-CaseRoot 'racepath'
+$rpDir = Join-Path $dataRoot 'racepath'
+$pr1 = Start-Cli @('acquire', "path:$rpDir", '-Wait', '0', '-Owner', 'rp1', '-Ttl', '30s')
+$pr2 = Start-Cli @('acquire', "path:$rpDir", '-Wait', '0', '-Owner', 'rp2', '-Ttl', '30s')
+$rc1 = Complete-Cli $pr1
+$rc2 = Complete-Cli $pr2
+$codes = @($rc1.Code, $rc2.Code) | Sort-Object
+Check 'exactly one success(0) and one conflict(2) (matrix 1)' (($codes -join ',') -eq '0,2') "codes=$($codes -join ',')"
+Check 'only one lock file exists after the race' ((Get-LeaseFiles $root).Count -eq 1) "files=$((Get-LeaseFiles $root).Count)"
+Check 'the acquire mutex did not linger after the race' (-not (Test-Path (Join-Path $root '_global.lock'))) ''
+Clear-CaseLeases
+
+# ---------------- 28. opposite request order cannot deadlock (matrix 6, G2)
+Write-Host ''
+Write-Host '[28] opposite request order: no deadlock, no partial hold (matrix 6)' -ForegroundColor Cyan
+$root = New-CaseRoot 'order'
+$ordDir = Join-Path $dataRoot 'order1'
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$pa = Start-Cli @('acquire', "path:$ordDir", 'port:9451', '-Wait', '0', '-Owner', 'ordA', '-Ttl', '30s')
+$pb = Start-Cli @('acquire', 'port:9451', "path:$ordDir", '-Wait', '0', '-Owner', 'ordB', '-Ttl', '30s')
+$oc1 = Complete-Cli $pa
+$oc2 = Complete-Cli $pb
+$sw.Stop()
+$ocodes = @($oc1.Code, $oc2.Code) | Sort-Object
+Check 'both opposite-order racers finish instead of deadlocking (G2)' ($sw.ElapsedMilliseconds -lt 25000) "elapsed=$($sw.ElapsedMilliseconds)ms"
+Check 'exactly one of them gets BOTH keys (matrix 6)' (($ocodes -join ',') -eq '0,2') "codes=$($ocodes -join ',')"
+$ordFiles = Get-LeaseFiles $root
+Check 'the loser left no partial hold behind' ($ordFiles.Count -eq 2) "files=$(($ordFiles | ForEach-Object { $_.Name }) -join ',')"
+$ordIds = @()
+foreach ($f in $ordFiles) {
+  $m = $null
+  try { $m = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { }
+  if ($m) { $ordIds += [string]$m.id }
+}
+Check 'the two surviving files belong to ONE lease id' ((@($ordIds | Sort-Object -Unique)).Count -eq 1) "ids=$($ordIds -join ',')"
+$sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+$pc = Start-Cli @('acquire', "path:$ordDir", 'port:9451', '-Wait', '2s', '-Owner', 'ordC', '-Ttl', '30s')
+$oc3 = Complete-Cli $pc
+$sw2.Stop()
+Check 'a QUEUEING racer gives up with exit 2 when the wait expires' ($oc3.Code -eq 2) "code=$($oc3.Code) err=$($oc3.Err)"
+Check 'the queueing racer rolled back and left no residue' ((Get-LeaseFiles $root).Count -eq 2) "files=$((Get-LeaseFiles $root).Count)"
+Check 'the queueing racer actually waited before giving up' ($sw2.ElapsedMilliseconds -ge 1500) "elapsed=$($sw2.ElapsedMilliseconds)ms"
+Clear-CaseLeases
+
+# ------------ 29. liveness beats TTL: dead pid, PID reuse, live, cross-host
+Write-Host ''
+Write-Host '[29] liveness beats TTL (matrix 8, 9)' -ForegroundColor Cyan
+$root = New-CaseRoot 'liveness'
+$nowMs = Get-NowMs
+$selfHost = [Environment]::MachineName
+
+# (a) same host, pid gone -> immediate reclaim, even with 60s of TTL left
+$deadPath = Join-Path $root 'live_probe.lock'
+Write-RawLock $deadPath ([ordered]@{
+  id = 'lz_deadowner1'; key = 'live:probe'; facet = 'live:probe'; facets = @('live:probe')
+  mode = 'exclusive'; slots = 1; slot = 0
+  owner = [ordered]@{ agent = 'ghost'; session = 'sess-ghost'; pid = 999999; host = $selfHost; procStart = ($nowMs - 5000) }
+  reason = 'crashed-holder'; pid = 999999; host = $selfHost
+  createdAt = $nowMs; expiresAt = ($nowMs + 60000); lockPath = $deadPath
+})
+$deadMeta = $null
+try { $deadMeta = [System.IO.File]::ReadAllText($deadPath) | ConvertFrom-Json } catch { }
+Check 'the dead-owner lease still has ~60s of TTL left (not expired)' ($deadMeta -and ([int64]$deadMeta.expiresAt -gt $nowMs)) ''
+Check 'status marks a provably dead owner as takeable' ((Get-Status) -match 'DEAD') "out=$(Get-Status)"
+$r = Invoke-Cli @('acquire', 'live:probe', '-Wait', '0', '-Owner', 'reaper', '-Ttl', '30s')
+Check 'a lease whose owner pid is gone is reclaimed at once (matrix 8)' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Check 'the liveness reclaim says why it happened' ($r.Err -match 'owner is gone') "err=$($r.Err)"
+$null = Invoke-Cli @('release', '--all', '-Owner', 'reaper')
+
+# (b) same host, pid alive but procStart mismatched -> PID reuse, reclaim
+$reusePath = Join-Path $root 'live_reuse.lock'
+Write-RawLock $reusePath ([ordered]@{
+  id = 'lz_reuse1'; key = 'live:reuse'; facet = 'live:reuse'; facets = @('live:reuse')
+  mode = 'exclusive'; slots = 1; slot = 0
+  owner = [ordered]@{ agent = 'recycled'; session = 'sess-x'; pid = $PID; host = $selfHost; procStart = 1 }
+  reason = 'pid-reused'; pid = $PID; host = $selfHost
+  createdAt = $nowMs; expiresAt = ($nowMs + 60000); lockPath = $reusePath
+})
+$r = Invoke-Cli @('acquire', 'live:reuse', '-Wait', '0', '-Owner', 'reuser', '-Ttl', '30s')
+Check 'PID reuse (procStart mismatch) is reclaimed at once (matrix 9)' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$null = Invoke-Cli @('release', '--all', '-Owner', 'reuser')
+
+# (c) same host, pid alive and procStart correct -> must NOT be reclaimed
+$alivePath = Join-Path $root 'live_alive.lock'
+Write-RawLock $alivePath ([ordered]@{
+  id = 'lz_alive1'; key = 'live:alive'; facet = 'live:alive'; facets = @('live:alive')
+  mode = 'exclusive'; slots = 1; slot = 0
+  owner = [ordered]@{ agent = 'live-owner'; session = 'sess-live'; pid = $PID; host = $selfHost; procStart = (Get-SelfStartMs) }
+  reason = 'still-running'; pid = $PID; host = $selfHost
+  createdAt = $nowMs; expiresAt = ($nowMs + 60000); lockPath = $alivePath
+})
+$r = Invoke-Cli @('acquire', 'live:alive', '-Wait', '0', '-Owner', 'late')
+Check 'a live owner with a matching procStart is NOT reclaimed' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'the live owner is named in the conflict' ($r.Err -match 'live-owner') "err=$($r.Err)"
+
+# (d) another host -> only the TTL may judge it
+$farPath = Join-Path $root 'live_far.lock'
+Write-RawLock $farPath ([ordered]@{
+  id = 'lz_far1'; key = 'live:far'; facet = 'live:far'; facets = @('live:far')
+  mode = 'exclusive'; slots = 1; slot = 0
+  owner = [ordered]@{ agent = 'far-owner'; session = 'sess-far'; pid = 999999; host = 'SOME-OTHER-PC'; procStart = 123 }
+  reason = 'remote'; pid = 999999; host = 'SOME-OTHER-PC'
+  createdAt = $nowMs; expiresAt = ($nowMs + 60000); lockPath = $farPath
+})
+$r = Invoke-Cli @('acquire', 'live:far', '-Wait', '0', '-Owner', 'local-guy')
+Check 'a dead pid on ANOTHER host is not judged (TTL only)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Clear-CaseLeases
+
+# ------------------- 30. facet expansion: profile dir, cdp port, screen/window
+Write-Host ''
+Write-Host '[30] facet expansion across classes (matrix 4)' -ForegroundColor Cyan
+$root = New-CaseRoot 'facets'
+$savedProfiles = $env:DSH_BROWSER_PROFILE_ROOT
+$profileRoot = Join-Path $dataRoot 'profiles'
+$env:DSH_BROWSER_PROFILE_ROOT = $profileRoot
+$r = Invoke-Cli @('acquire', 'browser:profile:work', '-Owner', 'bw', '-Ttl', '60s', '-Reason', 'shot')
+Check 'browser:profile:work acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$bwLease = ConvertTo-Lease $r.Out
+Check 'it expands into two facets (key + profile directory)' ($bwLease -and @($bwLease.facets).Count -eq 2) "facets=$($bwLease.facets -join ',')"
+Check 'the primary lock file is still sanitizeKey(canonicalKey)' (Test-Path (Join-Path $root 'browser_profile_work.lock') -PathType Leaf) ''
+Check 'the profile path facet got its own file' (@($bwLease.locks | Where-Object { Test-Path $_ }).Count -eq 2) ''
+$profDir = Join-Path $profileRoot 'work'
+$r = Invoke-Cli @('acquire', "path:$profDir", '-Wait', '0', '-Owner', 'other')
+Check 'another agent naming the profile DIRECTORY collides (matrix 4)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'the collision names the path facet' ($r.Err -match 'path:c:') "err=$($r.Err)"
+$null = Invoke-Cli @('release', $bwLease.id)
+
+$r = Invoke-Cli @('acquire', 'browser:cdp:9222', '-Owner', 'cdpA', '-Ttl', '30s')
+Check 'browser:cdp:9222 acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', 'port:9222', '-Wait', '0', '-Owner', 'portB')
+Check 'a plain port:9222 collides with browser:cdp:9222' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+
+$r = Invoke-Cli @('acquire', 'window:hwnd:197772', '-Owner', 'winA', '-Ttl', '30s')
+Check 'a window can be held' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', 'screen:focus', '-Wait', '0', '-Owner', 'focusA', '-Ttl', '30s')
+Check 'screen:focus does NOT conflict with window:* (no over-serialization)' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$env:DSH_BROWSER_PROFILE_ROOT = $savedProfiles
+Clear-CaseLeases
+
+# ------------------------------- 31. shared + shared, shared + exclusive
+# Contract 8.6 is explicit: in v2.0 `shared` is DECLARED intent, not a real
+# multi-reader. The storage model is one facet file with O_EXCL, so the SECOND
+# shared request must be refused - exactly as the plugin's lockPathFor() does it.
+# This section used to assert the opposite (64 `.shared-<n>.lock` slots), i.e. a
+# CLI-only multi-reader the contract says does not exist; the CLI and the plugin
+# then disagreed about the same request. The predicate (3.2, matrix 10) still
+# allows shared+shared; the STORE is what refuses it, which is the point of 8.6.
+Write-Host ''
+Write-Host '[31] shared mode is a single holder (8.6); a writer still excludes it (matrix 11)' -ForegroundColor Cyan
+$root = New-CaseRoot 'shared'
+$shDir = Join-Path $dataRoot 'shared'
+$r = Invoke-Cli @('acquire', "path:$shDir", '-Mode', 'shared', '-Owner', 'sh1', '-Ttl', '60s')
+Check 'the first shared holder acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', "path:$shDir", '-Mode', 'shared', '-Owner', 'sh2', '-Ttl', '60s')
+Check 'a second shared holder is REFUSED (8.6: no multi-reader in v2.0)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out) err=$($r.Err)"
+Check 'a refused shared request created no second lock file' ((Get-LeaseFiles $root).Count -eq 1) "files=$((Get-LeaseFiles $root).Count)"
+Check 'the refusal points at pool for concurrent readers' ($r.Err -match 'pool') "err=$($r.Err)"
+Check 'no .shared-N file was ever written' (@(Get-ChildItem $root -File -Filter '*.shared-*.lock').Count -eq 0) ''
+$r = Invoke-Cli @('acquire', "path:$shDir", '-Mode', 'exclusive', '-Wait', '0', '-Owner', 'ex1')
+Check 'an exclusive request conflicts with shared holders (matrix 11)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$out = Get-Status
+Check 'status shows the shared holder as the single holder' (($out -match 'sh1') -and -not ($out -match 'sh2')) "out=$out"
+# The escape hatch the contract points at must actually work.
+$r = Invoke-Cli @('acquire', "path:$shDir", '-Mode', 'pool', '-Slots', '2', '-Owner', 'poolA', '-Ttl', '60s')
+Check 'pool is the supported way to admit concurrent readers (8.6)' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Clear-CaseLeases
+
+# ----------------------------- 32. --keys comma form (CLI surface, section 7.2)
+Write-Host ''
+Write-Host '[32] --keys comma form for acquire and run' -ForegroundColor Cyan
+$root = New-CaseRoot 'keyscsv'
+$csvDir = Join-Path $dataRoot 'csv'
+$r = Invoke-Cli @('acquire', '--keys', "path:$csvDir,port:9461", '-Owner', 'csvA', '-Ttl', '60s', '-Reason', 'csv')
+Check '--keys a,b acquires both keys' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$csvLease = ConvertTo-Lease $r.Out
+Check 'the comma form produced two facets' ($csvLease -and @($csvLease.facets).Count -eq 2) ''
+Check 'both comma-form facets are on disk' (@($csvLease.locks | Where-Object { Test-Path $_ }).Count -eq 2) ''
+$r = Invoke-Cli @('release', $csvLease.id)
+Check 'the comma-form lease releases both facets' ($r.Code -eq 0 -and (Get-LeaseFiles $root).Count -eq 0) "code=$($r.Code) files=$((Get-LeaseFiles $root).Count)"
+$r = Invoke-Cli @('run', '--keys', "path:$csvDir,port:9462", '-Cmd', 'exit 0')
+Check 'run --keys a,b works' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Check 'run released every facet it took' ((Get-LeaseFiles $root).Count -eq 0) "files=$((Get-LeaseFiles $root).Count)"
+$r = Invoke-Cli @('run', '--keys', "path:$csvDir,port:9462", '-Cmd', 'exit 3')
+Check 'run still propagates the child exit code with several keys' ($r.Code -eq 3) "code=$($r.Code) err=$($r.Err)"
+Clear-CaseLeases
+
+# ---------------------------- 33. conflict output carries every field (4.3)
+Write-Host ''
+Write-Host '[33] conflict output: facet, holder identity, reason, remaining TTL' -ForegroundColor Cyan
+$root = New-CaseRoot 'conflictout'
+$savedSession = $env:DSH_SESSION_ID
+$env:DSH_SESSION_ID = 'sess-conflict-1'
+$cfDir = Join-Path $dataRoot 'conflict'
+$r = Invoke-Cli @('acquire', "path:$cfDir", '-Owner', 'holderX', '-Ttl', '120s', '-Reason', 'rendering charts')
+Check 'the holder acquires' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', "path:$cfDir\sub", '-Wait', '0', '-Owner', 'lateY')
+Check 'the blocked request exits 2' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+Check 'the conflict names the conflicting facet' ($r.Err -match 'path:c:') "err=$($r.Err)"
+Check 'the conflict carries the holder agent' ($r.Err -match 'agent=holderX') "err=$($r.Err)"
+Check 'the conflict carries the holder session' ($r.Err -match 'session=sess-conflict-1') "err=$($r.Err)"
+Check 'the conflict carries the holder pid' ($r.Err -match 'pid=\d+') "err=$($r.Err)"
+Check 'the conflict carries the holder host' ($r.Err -match 'host=[A-Za-z0-9._-]+') "err=$($r.Err)"
+Check 'the conflict carries the holder reason' ($r.Err -match 'reason=rendering charts') "err=$($r.Err)"
+Check 'the conflict carries the remaining TTL' ($r.Err -match '\d+ms left') "err=$($r.Err)"
+Check 'the conflict is also machine readable (JSON detail)' ($r.Err -match '"expiresInMs"') "err=$($r.Err)"
+Check 'the JSON detail carries the facet' ($r.Err -match '"facet":\s*"path:') "err=$($r.Err)"
+$env:DSH_SESSION_ID = $savedSession
+Check 'status never lists the acquire mutex as a lease' (-not ((Get-Status) -match '_global')) ''
+Check 'no acquire mutex was left behind' (-not (Test-Path (Join-Path $root '_global.lock'))) ''
+Clear-CaseLeases
+
+# -------------------------- 34. usage errors keep exit 3 (section 7.3)
+Write-Host ''
+Write-Host '[34] key syntax errors exit 3' -ForegroundColor Cyan
+$root = New-CaseRoot 'keysyntax'
+$scDir = Join-Path $dataRoot 'selfc'
+$r = Invoke-Cli @('acquire', "path:$scDir", "path:$scDir\child", '-Owner', 'sc1', '-Ttl', '30s')
+Check 'a request whose own keys conflict exits 3' ($r.Code -eq 3) "code=$($r.Code) out=$($r.Out)"
+Check 'a self-conflicting request created nothing' ((Get-LeaseFiles $root).Count -eq 0) ''
+$r = Invoke-Cli @('acquire', 'port:notaport', '-Owner', 'x')
+Check 'an unparseable port key exits 3' ($r.Code -eq 3) "code=$($r.Code)"
+$r = Invoke-Cli @('acquire', 'port:9230-9220', '-Owner', 'x')
+Check 'a reversed port range exits 3' ($r.Code -eq 3) "code=$($r.Code)"
+$r = Invoke-Cli @('acquire', 'path:', '-Owner', 'x')
+Check 'an empty path subject exits 3' ($r.Code -eq 3) "code=$($r.Code)"
+$r = Invoke-Cli @('run', '-Cmd', 'exit 0')
+Check 'run without any key exits 3' ($r.Code -eq 3) "code=$($r.Code)"
+
+# ------------------- 35. backend / IO failure is exit 4, never a silent pass
+Write-Host ''
+Write-Host '[35] an unusable lock root exits 4 (section 7.3)' -ForegroundColor Cyan
+$badRoot = Join-Path $testRoot 'notadir'
+[System.IO.File]::WriteAllText($badRoot, 'not a directory')
+$env:DSH_RESOURCE_LOCK_ROOT = $badRoot
+$r = Invoke-Cli @('acquire', 'io:key', '-Wait', '0', '-Owner', 'io1', '-Ttl', '30s')
+Check 'acquire against an unusable lock root exits 4' ($r.Code -eq 4) "code=$($r.Code) out=$($r.Out) err=$($r.Err)"
+Check 'the IO failure is explained on stderr' ($r.Err -match 'lock root') "err=$($r.Err)"
+$r = Invoke-Cli @('run', 'io:key', '-Cmd', 'exit 0')
+Check 'run reports the same backend failure as 4, not as a conflict' ($r.Code -eq 4) "code=$($r.Code) err=$($r.Err)"
+Check 'run did not claim to have acquired anything' (-not ($r.Err -match 'Acquired lease')) "err=$($r.Err)"
+
+# --------------------- 36. a path key must be absolute (contract section 2)
+# Resolving a relative path against the current directory would make the
+# canonical form depend on where the caller happened to run: two agents in
+# different directories would hold two different locks for ONE directory and
+# exclusion would fail silently. So a relative path is a hard error, not a
+# convenience.
+Write-Host ''
+Write-Host '[36] a relative path key is a hard error, not a cwd guess' -ForegroundColor Cyan
+$root = New-CaseRoot 'relpath'
+$r = Invoke-Cli @('acquire', 'path:relative/out', '-Owner', 'rel1', '-Ttl', '30s')
+Check 'a relative path key exits 3' ($r.Code -eq 3) "code=$($r.Code) out=$($r.Out) err=$($r.Err)"
+Check 'the error explains the absolute-path rule' ($r.Err -match 'ABSOLUTE') "err=$($r.Err)"
+Check 'the rejected relative key created no lock file' ((Get-LeaseFiles $root).Count -eq 0) ''
+$r = Invoke-Cli @('acquire', 'path:C:drive-relative', '-Owner', 'rel2', '-Ttl', '30s')
+Check 'a drive-relative path (C:foo) is rejected too' ($r.Code -eq 3) "code=$($r.Code) err=$($r.Err)"
+$r = Invoke-Cli @('acquire', ('path:' + (Join-Path $dataRoot 'abs')), '-Owner', 'rel3', '-Ttl', '30s')
+Check 'an absolute path key is accepted' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+Clear-CaseLeases
+
+# --------------- 37. the acquire order is a total order on the FULL key (3.4)
+# Two facets of the same class must still order deterministically, otherwise
+# two agents taking {profile:a, profile:b} in opposite orders can deadlock. An
+# orderKey that drops the qualifier would give both the same sort key.
+Write-Host ''
+Write-Host '[37] the acquire order is a total order on the full canonical key (3.4)' -ForegroundColor Cyan
+$root = New-CaseRoot 'ordertotal'
+$savedProfiles = $env:DSH_BROWSER_PROFILE_ROOT
+$env:DSH_BROWSER_PROFILE_ROOT = (Join-Path $dataRoot 'profiles2')
+$r = Invoke-Cli @('acquire', 'browser:profile:zzz', 'browser:profile:aaa', '-Owner', 'ord1', '-Ttl', '30s')
+Check 'two same-class keys acquire together' ($r.Code -eq 0) "code=$($r.Code) err=$($r.Err)"
+$ordLease = ConvertTo-Lease $r.Out
+Check 'same-class facets are ordered, not tied' ($ordLease -and @($ordLease.facets).Count -ge 2 -and $ordLease.facets[0] -ne $ordLease.facets[1]) "facets=$($ordLease.facets -join ',')"
+Check 'the ordinal order puts :aaa before :zzz' ($ordLease -and ($ordLease.facets -join ',') -match 'profile:aaa.*profile:zzz') "facets=$($ordLease.facets -join ',')"
+$r = Invoke-Cli @('acquire', 'browser:profile:aaa', 'browser:profile:zzz', '-Wait', '0', '-Owner', 'ord2')
+Check 'the reversed spelling of the same pair is the same request (busy)' ($r.Code -eq 2) "code=$($r.Code) out=$($r.Out)"
+$env:DSH_BROWSER_PROFILE_ROOT = $savedProfiles
+Clear-CaseLeases
 
 # ------------------------------------------------------------------- summary
 Write-Host ''

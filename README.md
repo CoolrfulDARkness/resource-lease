@@ -286,7 +286,10 @@ Resource leases in effect right now
 
 | 文件 | 给谁看 | 内容 |
 |---|---|---|
+| [docs/RESOURCE-MODEL-v2.md](docs/RESOURCE-MODEL-v2.md) | **实现者**(CLI / 插件 / 后端) | v2 契约:资源键语法、facet 展开、冲突谓词、全序、多资源原子获取、存活判定、后端抽象、**保证边界**、测试矩阵 |
+| [docs/RESOURCE-CLASSES.md](docs/RESOURCE-CLASSES.md) | **agent** / 要决定"该声明什么"的人 | 按场景查:跑浏览器、起 dev server、构建装依赖、改 git 仓库、发版部署、调限流 API 各自该申请哪些键 |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | **agent** / 往 prompt 里贴规则的人 | 什么时候必须申请、资源键规范、三模式、三步走、三条铁律、撞车回报格式 |
+| [docs/DESIGN.md](docs/DESIGN.md) | 想理解为什么这么设计的人 | 设计规格:三条原则、三类资源、facet 冲突模型、多键原子性、存活判定、后端抽象 |
 | [docs/CASE-STUDIES.md](docs/CASE-STUDIES.md) | 想判断问题真假的人 | 两个事故的脱敏复盘:资源形态、原始报错、后果链、"手工聊天租约为什么必然失效" |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | 想知道是不是重复发明的人 | 已有方案分四层对照 + 本方案相对差异 + 明确不声称的部分 |
 | [mcp/](mcp/) | 用任意 MCP 客户端、不绑框架的人 | stdio MCP server,零依赖单文件,跨平台 |

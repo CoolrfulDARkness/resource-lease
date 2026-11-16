@@ -6,26 +6,6 @@
 
 它和零依赖的 `cli/lease.ps1` **共用同一套锁文件**,所以「用 CLI 的 agent」和「用插件的 agent」互相排斥——这是本插件存在的主要理由。
 
-它给模型加的是三样东西:**运行时上下文**(每个 step 注入"现在谁占着什么",没有任何租约时不输出任何文本)、**三个工具**(`resource_acquire` / `resource_release` / `resource_status`)、**工具守卫**(`protectedTools` 里登记的工具,未持租约调用直接被拒)。MCP server 与 CLI **都没有第一样** —— 那是本插件与它们的主要差异。
-
-> **这是 DSH(DeepSeek Harness)插件。** 它按 bundle 形态发布:`package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`、`icon` 指向插件图标,DSH 靠这两个字段识别 bundle,不要删。`lib/*.js` 不依赖任何 `@deepseek-ai/*` 包(原因见 §1.1),所以本地目录 / 符号链接安装都能装载。分发与收录见 [PUBLISH.md](./PUBLISH.md)。
-
-## 安装
-
-```bash
-# 首选:本地目录。在 DSH 的插件安装入口里指向 ./plugin
-# install_bundle 装出来是一个符号链接,所以插件必须自包含(§1.1)
-# 仓库里已经有它,不需要额外下载
-```
-
-```bash
-# 备选:npm 包(当前未发布到 npm registry)
-# 发布之后 dshmarket 的一键安装才会走这条路;在此之前下面的命令会 404
-npm i dsh-resource-lease
-```
-
-装好后插件默认启用、默认配置即可工作;要改行为再动 `cordis.patch.yml`(§2)。
-
 ---
 
 ## 1. 它贡献了什么
@@ -40,7 +20,7 @@ npm i dsh-resource-lease
 
 ## 1.1 自包含(为什么没有任何 `@deepseek-ai/*` import)
 
-`install_bundle` 安装本地目录时用的是**符号链接**(`<profile>/node_modules/dsh-resource-lease` → 本目录),而 Node 按**真实路径**解析裸模块名。也就是说它从 `./plugin/...` 这样的工作区目录一路往上找,永远到不了 profile 的 `node_modules`,更到不了 `app.asar` 里 DSH 自带的 `@deepseek-ai/*`。
+`install_bundle` 安装本地目录时用的是**符号链接**(`profile\node_modules\dsh-resource-lease` → 本目录),而 Node 按**真实路径**解析裸模块名。也就是说它从 `D:\Banking Buddy\...` 一路往上找,永远到不了 profile 的 `node_modules`,更到不了 `app.asar` 里 DSH 自带的 `@deepseek-ai/*`。
 
 所以本插件的 `lib/*.js` **只 import `node:` 内建模块和同目录的 `./lock.js`**;动态 `import()` 也不行(同样解析不到),同样没有。代价是两个:
 
@@ -96,7 +76,7 @@ npm i dsh-resource-lease
 | `dir:src/parser` | 共享写目标 | `exclusive` |
 | `repo:root` | 一个 git 仓库 | `exclusive` |
 
-key 会被 sanitize 成 `[A-Za-z0-9._-]` 再当文件名,所以 `browser:chromium` 与 `browser_chromium` 是**同一个资源**。
+key 会被 sanitize 成 `[A-Za-z0-9._-]` 并转小写再当文件名,所以 `browser:chromium` 与 `browser_chromium` 是**同一个资源**,`Browser:Chromium` 与 `browser:chromium` 也是。
 
 ## 4. 模型侧的三个工具
 
@@ -187,13 +167,13 @@ then retry "pwsh". If "screen:focus" is busy, resource_status shows the current 
 | CLI 的租约索引 | `<lockRoot>/_leases/<leaseId>.json`,内容 `{ "id", "key", "path" }` |
 | 接管后的归档 | `<lockRoot>/<name>.lock.stale.<epochMs>.<pid>`(保留 1 小时) |
 
-`sanitize` = 把非 `[A-Za-z0-9._-]` 的字符替换成 `_`。
+`sanitize` = 把非 `[A-Za-z0-9._-]` 的字符替换成 `_`,**并转小写**。
 
 ### 原子性
 
 锁 = **一个文件**,用 `fs.openSync(path, 'wx')` 创建,即 `open(O_CREAT | O_EXCL)`:一次系统调用里完成「查存在 + 创建」,没有 TOCTOU 窗口。
 
-**绝不要用 `mkdir` / `CreateDirectory` 当锁**:目录创建是幂等的,并发时所有竞争者都会「成功」,互斥会静默失效。CLI 第一版就踩过这个坑。
+**绝不要用 `mkdir` / `CreateDirectory` 当锁**:目录锁的成败取决于"创建时是否抛异常" —— `-Force`、`[System.IO.Directory]::CreateDirectory`、`mkdir -p` 这类写法对已存在目录不抛,并发时所有竞争者都会「成功」,互斥会静默失效。文件 + `O_EXCL` 是单次系统调用判定,没有这个歧义。CLI 第一版就踩过这个坑。
 
 ### 锁文件内容
 
@@ -210,24 +190,13 @@ then retry "pwsh". If "screen:focus" is busy, resource_status shows the current 
   "host": "WORKSTATION",
   "createdAt": 1763200000000,
   "expiresAt": 1763200060000,
-  "lockPath": "<lockRoot>\\browser_chromium.slot-1.lock"
+  "lockPath": "C:\\Users\\me\\AppData\\Local\\dsh-resource-lease\\locks\\browser_chromium.slot-1.lock"
 }
 ```
 
 ### 接管过期锁的 CAS
 
 `fs.renameSync(lock, lock + '.stale.' + now + '.' + pid)` —— rename 就是 compare-and-swap:两个进程同时抢同一把过期锁时,只有 rename 成功的那一个继续,另一个因为源文件已消失而失败。失败即「别人抢先」,不重试同一把。
-
-### 释放也必须校验 id(不是按路径删)
-
-接管之后,**同一个路径上换了一把新租约**。旧持有者如果只按 `lockPath` 删除,删掉的就是新持有者的**活锁**,于是两个 agent 同时「持有」同一个资源,而且双方都毫不知情。
-
-所以释放路径读取锁文件里的 `id`,与要释放的 `id` 比对:
-
-- 一致 → 删除锁文件 + 清 `_leases` 索引记录;
-- 不一致 / 锁文件已不存在 → **一个字节都不删**,只丢掉自己那条过期记录并记日志。
-
-这与 MCP server 的 `releaseById()` 语义一致(它也是先比对 id 再删)。回归测试见 `test/release-after-takeover.test.js`(过期 → 接管 → 旧 id 释放 → 断言新持有者的锁仍存在)。
 
 ### 互操作方向(都已实测)
 
@@ -250,19 +219,8 @@ then retry "pwsh". If "screen:focus" is busy, resource_status shows the current 
 
 - **没有正式的 Config schema**(见 1.1)。配置照常生效,但插件详情里看不到字段说明,也没有 Loader 级的校验;写错的字段会静默回落默认值。排查配置问题时以 `normalizeConfig()` 为准。
 - 内联的 `defineTool` **不做** 原版的 schema 遍历式参数校验。`mode` / `slots` / `key` 这类真正会用到的字段会在 `execute` 里显式报错,但「多传了一个不认识的字段」不会被拦。
-- `release(id)` 只释放**本进程**持有的租约(内存里,或 `_leases` 索引里 `pid` 等于本进程的),而且只删仍然记着这个 `id` 的锁文件(见 §8)。跨进程释放请用 CLI 的 `release <id>`。
+- `release(id)` 只释放**本进程**持有的租约(内存里,或 `_leases` 索引里 `pid` 等于本进程的)。跨进程释放请用 CLI 的 `release <id>`。
 - 守卫判断「是否持有」只看 `owner` 是否等于调用方 agent 的 session id。若某个 agent 用 CLI 以 `$DSH_AGENT_NAME` 取锁,插件的守卫不认它(两边 owner 命名空间不同)。要混用就统一用插件工具取锁。
 - 锁根目录每读一次都扫一遍目录(取锁 / 列表 / prompt 上下文各一次)。租约数量是个位数,这点 I/O 可以忽略。
 - `steal` 会无视 TTL 强抢活锁,是逃生舱口,默认不开。
-- 锁文件先 `O_EXCL` 创建再写入元数据。极窄的窗口里,别的进程可能读到空文件并把 `null` 元数据当成「可接管」(CLI 的 `Read-Meta` 也是这个行为)。这是共享格式的既有性质,插件没有让它变差,但也没有修掉。
-
-## 11. 分发与收录(维护者)
-
-完整命令与注意事项见 [PUBLISH.md](./PUBLISH.md),这里只列要点:
-
-- **保持它是「DSH 插件」的形态**:`dsh.bundle.patch` 与 `icon` 两个字段是 DSH 识别 bundle 的依据,`files` 白名单要一直包含 `cordis.patch.yml`、`icon.svg`、`locale/*.json`。
-- **路径 A(无需账号授权,建议先做)**:仓库设为**公开**,并给 GitHub 仓库打上 topic **`dsh-plugin`**。目录站 Oh-My-DSH(每 4 小时)和 dsh-plugin-radar(每 15 分钟)会自动爬取带该 topic 的公开仓库,不需要任何提交动作。
-- **路径 B(npm)**:`npm publish --access public --registry https://registry.npmjs.org`。本机 `npm config get registry` 目前指向镜像,镜像**不能发新包**,必须显式带 `--registry`;发布前先把 `package.json` 里 `repository` / `homepage` / `bugs` 的占位符换成真实地址。
-- **路径 C**:在 DSH 的「插件 → 发现 → 索引源」里添加社区 catalog 的 `index.json`。
-
-`npm whoami` 在本机返回 `ENEEDAUTH`(未登录),发布动作必须由仓库维护者本人执行。
+- 锁文件先 `O_EXCL` 创建再写入元数据,所以存在一个极窄的窗口:别的进程可能读到空文件。**这个坑已经修掉**(CLI / MCP / 插件三处同一规则):`null` 元数据不再等于「可接管」,只有文件同时老于 2s(崩溃残留)才允许接管;接管后还会回读归档副本,若发现是有效未过期租约就放回去。回归测试见 `plugin/test/lock-rules.test.mjs`。

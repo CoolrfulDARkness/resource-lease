@@ -1,12 +1,9 @@
 # 资源租约 CLI(零改动层)
 
-不装插件、不改宿主,今天就能用 —— 标题里的"零改动层"就是这个意思:**不动宿主代码、不加插件,一个 `.ps1` 脚本谁要用谁调**。跨进程文件锁,带 TTL 与崩溃自愈。
-
-**平台要求:Windows 专用,需要 PowerShell 5.1+。** 脚本按 Windows PowerShell 5.1 的语义写(见「实现要点」),Linux / macOS 上不能直接跑;跨平台的是 MCP server,两者共用锁格式。
+不装插件、不改 DSH,今天就能用。跨进程文件锁,带 TTL 与崩溃自愈。
 
 ```powershell
-# 在仓库根目录执行
-$LEASE = "./cli/lease.ps1"
+$LEASE = "D:\Banking Buddy\.dsh-im\resource-lease\cli\lease.ps1"
 & $LEASE help
 ```
 
@@ -30,12 +27,11 @@ $LEASE = "./cli/lease.ps1"
 成功时把租约 JSON 打到 stdout(含 `id`、`expiresAt`),退出码 0。
 
 ```powershell
-& $LEASE acquire browser:chromium -Ttl 5m -Wait 120s -Reason "导出报表截图"
+& $LEASE acquire browser:chromium -Ttl 5m -Wait 120s -Reason "榜单截图"
 ```
 
-- `-Ttl` 默认 30s(或 `$DSH_RESOURCE_TTL`)。**长任务务必给足**,否则跑到一半锁被别人接管。没有"续期"操作,lease 不会自动延长。
+- `-Ttl` 默认 30s(或 `$DSH_RESOURCE_TTL`)。**长任务务必给足**,否则跑到一半锁被别人接管。
 - `-Wait` 默认 0(立即失败)。要排队就显式给。
-- 时长写法(`-Ttl` / `-Wait`,与 MCP 的 `ttlMs` / `waitMs` 同一套规则):数字是毫秒,带单位的字符串(`30s` / `500ms` / `2m`)按单位,**裸数字字符串(`"600"`、`-Ttl 600`)按秒**;解析不了直接退 3,TTL 下限 1000ms。详见 [docs/PROTOCOL.md](../docs/PROTOCOL.md) §5。
 - `-Owner` 不能为空:两个空 owner 无法区分,`release --all` 会互删租约,所以实现直接退 3。
 - `-Reason` 强烈建议填:主控和别的 agent 都靠它判断该等还是该改道。
 
@@ -46,10 +42,10 @@ $LEASE = "./cli/lease.ps1"
 ```
 
 ```
-key              mode        owner    reason          remain  pid
----              ----        -----    ------          ------  ---
-browser:chromium pool(1/2)   agent-a  导出报表截图    42s     14568
-port:9222        exclusive   agent-b  调试端口        8s      9912
+key              mode        owner  reason       remain  pid
+---              ----        -----  ------       ------  ---
+browser:chromium pool(1/2)   atk-3  榜单截图     42s     14568
+port:9222        exclusive   def-208 调试端口     8s     9912
 ```
 
 `remain` 显示 `EXPIRED(takeable)` 表示这条锁已过期、下一个人可以接管。
@@ -58,7 +54,7 @@ port:9222        exclusive   agent-b  调试端口        8s      9912
 
 ```powershell
 & $LEASE release <leaseId>              # 释放单个
-& $LEASE release --all -Owner agent-a     # 释放某个 agent 的全部
+& $LEASE release --all -Owner atk-3     # 释放某个 agent 的全部
 ```
 
 ### run —— 持租约执行(最实用)
@@ -84,7 +80,11 @@ port:9222        exclusive   agent-b  调试端口        8s      9912
 |---|---|
 | 0 | 成功 |
 | 2 | 资源被占 / 等待超时 / 找不到该租约 id(已释放,或已被接管) |
-| 3 | 参数错误(含空 owner) |
+| 3 | 参数错误(含空 owner、相对路径的 `path:` 键、未知 class 的近似拼写) |
+| 4 | 后端 / IO 错误(锁根不可写、锁根不可用等) |
+
+> **v2 新增 4。** 把"IO 出问题"和"资源被占"分开很重要:前者是环境坏了,重试没用;
+> 后者是对手在占,等一等可能就好。混成一个码会让调用方用错策略。
 
 `run` 是例外:**它透传子进程的退出码**,所以取值任意,子进程返回 2 不代表"资源被占"。区分办法看 stderr:有 `Resource busy` 且无 `Acquired lease` = 没拿到锁;有 `Acquired lease` = 锁拿到了、命令本身失败。
 
@@ -109,10 +109,14 @@ port:9222        exclusive   agent-b  调试端口        8s      9912
 ## 测试
 
 ```powershell
-& "./cli/tests/test-lease.ps1"
+& "D:\Banking Buddy\.dsh-im\resource-lease\cli\tests\test-lease.ps1"
 ```
 
-一条测试脚本(`./cli/tests/test-lease.ps1`)、20 组用例、**93 条断言**,全部真起子进程(不是假 job),覆盖:独占互斥、跨进程竞争、TTL 接管、崩溃残留自愈(造真实 `.lock` 文件残骸并断言 `.stale` 计数 0→1)、pool 名额、`run` 异常释放、退出码、以及三条回归:**接管后旧 id 释放不误删新锁**、**`run` 中途被接管不误删**、**键大小写归一 / 半写锁文件不可抢**。用临时锁根目录,且**每个用例一个独立锁根**,不污染真实环境、也不跨用例串味。
+37 项(含 20 组 v1 用例 + 17 组 v2 用例下的 **207 条断言**),全部真起子进程(不是假 job),覆盖:独占互斥、跨进程竞争、TTL 接管、崩溃残留自愈(造真实 `.lock` 文件残骸并断言 `.stale` 计数 0→1)、pool 名额、`run` 异常释放、退出码、以及三条回归:**接管后旧 id 释放不误删新锁**、**`run` 中途被接管不误删**、**键大小写归一 / 半写锁文件不可抢**。
+
+v2 新增覆盖(对应 `docs/RESOURCE-MODEL-v2.md` §11 测试矩阵):多键原子获取 `[21]`、canonical 归一 `[24]`、多键中途失败逆序回滚无残留 `[25]`、删掉 `_leases/` 索引后互斥仍成立 `[26]`、两进程抢同一 facet 恰好一个赢 `[27]`、**相反顺序请求不死锁** `[28]`、存活判定优先于 TTL `[29]`、跨 class facet 展开 `[30]`、shared 读者共存与写者互斥 `[31]`、`--keys` 逗号形式 `[32]`、冲突输出含持有者全字段 `[33]`、键语法错 exit 3 `[34]`、锁根不可用 exit 4 `[35]`、**path 必须是绝对路径** `[36]`、**orderKey 是全序** `[37]`。
+
+用临时锁根目录,且**每个用例一个独立锁根**,不污染真实环境、也不跨用例串味;v2 的 15 个组每组末尾还有兜底清理,防止某个组忘了释放的持有者伪装成产品 bug。
 
 ## 已知局限
 

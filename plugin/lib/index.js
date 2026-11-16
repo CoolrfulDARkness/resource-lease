@@ -42,6 +42,7 @@
 
 import os from 'node:os'
 import * as lock from './lock.js'
+import * as resources from './resources.js'
 
 const MODES = ['exclusive', 'shared', 'pool']
 const ON_TIMEOUT = ['fail', 'queue', 'steal']
@@ -95,6 +96,9 @@ function parameterSchema(properties) {
     const value = { type: node.type }
     if (node.description !== undefined) value.description = node.description
     if (Array.isArray(node.enum)) value.enum = [...node.enum]
+    // An array node without `items` is an incomplete schema, and the registry
+    // validates the finished schema, so `items` has to survive the shorthand.
+    if (node.items !== undefined) value.items = node.items
     compiled[name] = value
     if (node.required === true) required.push(name)
   }
@@ -177,6 +181,20 @@ function normalizeConfig(raw) {
     }
   }
 
+  // §3.3.1: browser:profile:<name> can only expand to a directory facet when
+  // the mapping is supplied. Without it the profile key stays a singleton and
+  // the directory it actually owns is NOT protected -- which is why the plugin
+  // has to be able to pass a table through, and why an unresolved alias is
+  // surfaced rather than silently ignored.
+  const aliases = {}
+  if (c.aliases && typeof c.aliases === 'object' && !Array.isArray(c.aliases)) {
+    for (const [key, target] of Object.entries(c.aliases)) {
+      if (typeof key !== 'string' || key.trim() === '') continue
+      if (typeof target !== 'string' || target.trim() === '') continue
+      aliases[key.trim()] = target.trim()
+    }
+  }
+
   // The CLI honours DSH_RESOURCE_TTL; only let it through when the row does
   // not set defaultTtlMs, so explicit configuration always wins.
   const ttlFromEnv = c.defaultTtlMs === undefined ? lock.toMs(process.env.DSH_RESOURCE_TTL, undefined) : undefined
@@ -196,6 +214,7 @@ function normalizeConfig(raw) {
     onTimeout: ON_TIMEOUT.includes(c.onTimeout) ? c.onTimeout : 'fail',
     resources,
     protectedTools,
+    aliases,
   }
 }
 
@@ -295,6 +314,46 @@ export function apply(ctx, config) {
   /** Disposers registered on agent contexts, so plugin unload removes them. */
   const agentCleanups = new Set()
 
+  /**
+   * The lease backend (§6 of RESOURCE-MODEL-v2).
+   *
+   * localBackend wraps the SAME lock root the CLI uses, which is what makes a
+   * CLI holder and a plugin holder exclude each other. Keeping every disk touch
+   * behind this object is also what would let a broker backend be dropped in
+   * without changing the call sites.
+   */
+  const backend = lock.localBackend(cfg.lockRoot, {
+    warn: (message) => log.warn(message),
+  })
+
+  // Install the alias table (§3.3.1) before anything can expand a key. The
+  // resource model keeps it as module state, so the lock kernel's facetsOf()
+  // picks it up without every call site having to thread it through.
+  if (Object.keys(cfg.aliases).length > 0) {
+    try {
+      resources.setAliases(cfg.aliases)
+    } catch (error) {
+      log.warn('could not install the alias table:', error instanceof Error ? error.message : error)
+    }
+  }
+
+  // An alias that cannot be resolved means a key the caller believes is
+  // protected is not actually protected. Say so once at startup rather than
+  // letting it fail silently later.
+  for (const key of Object.keys(cfg.aliases)) {
+    try {
+      const report = resources.expandReport(key)
+      const unresolved = Array.isArray(report?.unresolved) ? report.unresolved : []
+      for (const row of unresolved) {
+        if (row?.unresolved === 'required') {
+          log.warn(`alias "${key}" could not be resolved (${row.id}); that resource is NOT protected until it is`)
+        }
+      }
+    } catch {
+      /* reporting is best effort; a broken key must not stop the plugin */
+    }
+  }
+
   // ---------------------------------------------------------------- state
 
   /**
@@ -309,17 +368,36 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Whether `owner` currently holds `key`.
+   * Whether `owner` currently holds something that covers `key`.
+   *
+   * Facet-aware on purpose: `holds(owner, "path:d:/out")` is true when the owner
+   * leased `path:d:/out/sub`, because holding the subdirectory covers the parent
+   * for the guard's purposes. A plain string comparison here would let the guard
+   * wave through exactly the ancestor/descendant collisions v2 exists to catch.
    *
    * @param {string} owner owner name.
    * @param {string} key resource key.
-   * @returns {boolean} true when a live lease matches.
+   * @returns {boolean} true when a live lease of this owner covers `key`.
    */
   function holds(owner, key) {
     const now = Date.now()
-    return lock
-      .listLocks(cfg.lockRoot)
-      .some((meta) => meta.owner === owner && meta.key === key && !lock.isExpired(meta, now))
+    const wanted = lock.facetsOf(key)
+    return lock.listLocks(cfg.lockRoot).some((meta) => {
+      if (meta.owner !== owner) return false
+      if (lock.isExpired(meta, now)) return false
+      const mine = lock.facetsOfMeta(meta)
+      const mode = typeof meta.mode === 'string' ? meta.mode : 'exclusive'
+      for (const facet of wanted) {
+        for (const heldFacet of mine) {
+          if (facet === heldFacet) return true
+          // Both sides are checked because the implication table is not
+          // guaranteed to be symmetric for every class pair.
+          if (lock.facetsClash(facet, 'exclusive', heldFacet, mode)) return true
+          if (lock.facetsClash(heldFacet, mode, facet, 'exclusive')) return true
+        }
+      }
+      return false
+    })
   }
 
   /**
@@ -348,45 +426,52 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Release one lease: delete its lock file and its index record.
+   * Release one lease: every facet file it owns, plus its index records.
    *
-   * The lock file is authoritative. After a takeover the SAME path holds the
-   * NEW holder's lease, so the delete is guarded by an id comparison
-   * (lock.removeIfOwned) -- releasing by path alone would delete a live lock
-   * that belongs to someone else. When the ids disagree, nothing is deleted:
-   * the stale local record is dropped and the mismatch is logged, which is the
-   * same semantics as the MCP server's releaseById().
+   * A v2 lease covers a SET of facet files, so releasing means "remove each of
+   * them, and only the ones still carrying this id". lock.releaseMany() does
+   * that with an id check per file (removeIfOwned semantics): after a takeover
+   * the same path holds the NEW holder's lease, so a delete by path alone would
+   * destroy a live lock belonging to someone else. When the ids disagree nothing
+   * is deleted, the stale local record is dropped, and the mismatch is logged.
    *
    * @param {string} id lease id.
-   * @returns {boolean} true when this process's lock file was actually removed.
+   * @returns {boolean} true when at least one lock file was actually removed.
    */
   function releaseOne(id) {
     if (typeof id !== 'string' || id === '') return false
 
     const meta = held.get(id)
-    if (meta !== undefined) {
+    if (meta !== undefined && Number(meta.pid) !== process.pid) {
       // A lease recorded in memory is still only releasable by the process
       // that created it.
-      if (Number(meta.pid) !== process.pid) return false
-      const result = lock.removeIfOwned(meta.lockPath, id)
-      lock.removeIndex(cfg.lockRoot, id)
-      forget(id)
-      if (!result.removed) logNotOurs(id, result.onDiskId)
-      return result.removed
+      return false
     }
-    // Not in memory: the plugin may have been reloaded while holding it, so
-    // fall back to the shared index -- but only for this process's own leases.
-    const record = lock.readIndex(cfg.lockRoot, id)
-    if (record === null) return false
-    const lockPath = typeof record.path === 'string' ? record.path : ''
-    if (lockPath === '') return false
-    const onDisk = lock.readMeta(lockPath)
-    const ownedHere = onDisk !== null && Number(onDisk.pid) === process.pid
-    if (!ownedHere) return false
-    const result = lock.removeIfOwned(lockPath, id)
-    lock.removeIndex(cfg.lockRoot, id)
-    if (!result.removed) logNotOurs(id, result.onDiskId)
-    return result.removed
+
+    let result
+    try {
+      result = lock.releaseMany(backend, id, { warn: (message) => log.warn(message) })
+    } catch (error) {
+      log.warn(`releasing lease ${id} failed:`, error instanceof Error ? error.message : error)
+      return false
+    }
+
+    forget(id)
+    const releasedFacets = Array.isArray(result?.releasedFacets) ? result.releasedFacets : []
+    const kept = Array.isArray(result?.kept) ? result.kept : []
+    const missing = Array.isArray(result?.missing) ? result.missing : []
+    if (kept.length > 0) {
+      log.warn(`lease ${id}: ${kept.length} facet(s) were taken over by another holder; left their lock files in place`)
+    }
+    // The lease was in our local record but every one of its lock files is
+    // gone: someone removed them out from under us (or a takeover archived
+    // them). That is not a successful release and it must not pass silently --
+    // the v1 behaviour logged it, and a caller reading "released" would
+    // otherwise believe the resource is free when it may not be.
+    if (releasedFacets.length === 0 && missing.length > 0) {
+      logNotOurs(id, null)
+    }
+    return releasedFacets.length > 0
   }
 
   // -------------------------------------------------------------- acquire
@@ -453,62 +538,129 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Acquire a lease, waiting up to `waitMs` for a busy resource.
+   * Normalize the caller's request into the §7.1 request list.
    *
-   * @param {{ key?: string, mode?: string, slots?: number, ttlMs?: number | string, waitMs?: number | string, reason?: string, owner?: string }} [req] lease request.
-   * @returns {Promise<Record<string, any>>} the acquired lease.
+   * Accepts either a single `key` (v1 shape, kept so existing callers and the
+   * protectedTools guard keep working) or a `resources` array (v2 shape, which
+   * is what makes "this operation needs the output dir AND the port AND the
+   * profile" expressible as one all-or-nothing lease).
+   *
+   * @param {{ key?: string, mode?: string, slots?: number, resources?: Array<Record<string, any>> }} req request.
+   * @returns {Array<{ key: string, mode?: string, slots?: number }>} request list.
+   */
+  function normalizeRequests(req) {
+    const list = []
+    if (Array.isArray(req.resources)) {
+      for (const entry of req.resources) {
+        if (!entry || typeof entry !== 'object') continue
+        const key = typeof entry.key === 'string' ? entry.key.trim() : ''
+        if (key === '') continue
+        list.push({ key, mode: entry.mode, slots: entry.slots })
+      }
+    }
+    if (list.length === 0 && typeof req.key === 'string' && req.key.trim() !== '') {
+      list.push({ key: req.key.trim(), mode: req.mode, slots: req.slots })
+    }
+    if (list.length === 0) {
+      throw new Error(
+        'resource lease: pass "key" (one resource) or "resources" (a list of {key, mode?, slots?}) - '
+        + 'e.g. resources: [{key:"path:d:/out"}, {key:"port:9222"}]',
+      )
+    }
+    for (const entry of list) {
+      if (entry.mode !== undefined && entry.mode !== null && !MODES.includes(entry.mode)) {
+        throw new Error(`resource lease: mode must be one of ${MODES.join(', ')} (got ${JSON.stringify(entry.mode)})`)
+      }
+      if (entry.slots !== undefined && entry.slots !== null
+        && (!Number.isFinite(Number(entry.slots)) || Number(entry.slots) < 1)) {
+        throw new Error(`resource lease: slots must be a positive whole number (got ${JSON.stringify(entry.slots)})`)
+      }
+    }
+    return list
+  }
+
+  /**
+   * Acquire one lease covering every requested resource, atomically.
+   *
+   * The lease is all-or-nothing: if any facet is busy the whole acquisition
+   * rolls back and the error names the facet, its holder, their reason and the
+   * remaining time. That is deliberate -- a half-acquired lease is a deadlock
+   * waiting to happen, and a partial hold is worse than no hold because the
+   * caller believes it owns more than it does.
+   *
+   * @param {{ key?: string, mode?: string, slots?: number, resources?: Array<Record<string, any>>, ttlMs?: number | string, waitMs?: number | string, reason?: string, owner?: string }} [req] lease request.
+   * @returns {Record<string, any>} the acquired lease.
    */
   async function lease(req = {}) {
-    const key = typeof req.key === 'string' ? req.key.trim() : ''
-    if (key === '') throw new Error('resource lease: "key" is required, e.g. "browser:chromium"')
+    const requests = normalizeRequests(req)
 
-    // defineTool's argument-schema validation is not available to a
-    // self-contained plugin, so the fields the caller can get wrong are
-    // rejected here with a message the model can act on instead of being
-    // silently coerced.
-    if (req.mode !== undefined && req.mode !== null && !MODES.includes(req.mode)) {
-      throw new Error(`resource lease: mode must be one of ${MODES.join(', ')} (got ${JSON.stringify(req.mode)})`)
-    }
-    if (req.slots !== undefined && req.slots !== null && (!Number.isFinite(Number(req.slots)) || Number(req.slots) < 1)) {
-      throw new Error(`resource lease: slots must be a positive whole number (got ${JSON.stringify(req.slots)})`)
-    }
-
-    const mapped = cfg.resources[key]
-    const mode = MODES.includes(req.mode) ? req.mode : mapped?.mode ?? 'exclusive'
-    const slots = mode === 'pool'
-      ? Math.max(1, Math.trunc(Number.isFinite(req.slots) ? req.slots : mapped?.slots ?? 1))
-      : 1
     const ttlMs = Math.max(1000, lock.toMs(req.ttlMs, cfg.defaultTtlMs))
     const waitMs = Math.min(cfg.maxWaitMs, lock.toMs(req.waitMs, 0))
-    const owner = typeof req.owner === 'string' && req.owner !== '' ? req.owner : processOwner()
+    const ownerName = typeof req.owner === 'string' && req.owner !== '' ? req.owner : processOwner()
     const reason = typeof req.reason === 'string' ? req.reason : ''
-    const spec = { key, mode, slots, ttlMs, owner, reason }
+    // cfg.onTimeout 'steal' is intentionally not forwarded: acquireMany has no
+    // steal strategy, and a steal is only ever legitimate from a recovery path,
+    // never from an ordinary acquire.
+    const strategy = cfg.onTimeout === 'queue' ? 'queue' : 'fail'
 
     lock.ensureLockRoot(cfg.lockRoot)
-    const deadline = Date.now() + waitMs
 
-    for (;;) {
-      const acquired = attempt(spec)
-      if (acquired !== null) return acquired
+    const result = lock.acquireMany(backend, requests, {
+      ttlMs,
+      reason,
+      owner: lock.currentOwner(ownerName),
+      strategy,
+      waitMs,
+    })
 
-      if (Date.now() >= deadline) {
-        if (cfg.onTimeout === 'queue') {
-          await sleep(150)
-          continue
-        }
-        if (cfg.onTimeout === 'steal') {
-          const stolen = attempt({ ...spec, force: true })
-          if (stolen !== null) return stolen
-        }
-        const error = new Error(
-          `Resource busy: ${key} - held by ${describeHolders(key, mode, slots)}. `
-          + 'Wait for the holder to release it (or let its TTL expire), then acquire again.',
-        )
-        error.code = 'RESOURCE_BUSY'
-        throw error
-      }
-      await sleep(150)
+    if (result === null || typeof result !== 'object') {
+      throw new Error('resource lease: the lock kernel returned no result')
     }
+
+    if (result.ok !== true) {
+      const conflicts = Array.isArray(result.conflicts) ? result.conflicts : []
+      const detail = conflicts.length === 0
+        ? 'no conflict detail was reported'
+        : conflicts.map((row) => {
+          const who = row.heldBy ?? {}
+          const whoText = [who.agent ?? 'unknown', who.session, who.pid !== undefined ? `pid ${who.pid}` : '', who.host]
+            .filter((part) => part !== undefined && part !== null && part !== '').join(' / ')
+          const left = Number(row.expiresInMs)
+          const leftText = Number.isFinite(left) ? `${Math.ceil(left / 1000)}s left` : 'expiry unknown'
+          const why = row.reason ? `, reason: ${row.reason}` : ''
+          return `${row.facet} held by ${whoText} (${leftText}${why})`
+        }).join('; ')
+      const rolled = Array.isArray(result.released) && result.released.length > 0
+        ? ` Nothing was kept: ${result.released.length} already-acquired facet(s) were rolled back.`
+        : ''
+      const error = new Error(
+        `Resource busy: ${detail}. Wait for the holder to release it (or let its TTL expire), then acquire again.${rolled}`,
+      )
+      error.code = 'RESOURCE_BUSY'
+      error.conflicts = conflicts
+      throw error
+    }
+
+    // Remember it locally so release-by-id works even for a multi-facet lease,
+    // and so releaseAll can find this process's leases without a disk scan.
+    const record = {
+      id: String(result.id),
+      key: String(result.key ?? requests[0].key),
+      facets: Array.isArray(result.facets) ? result.facets : [],
+      mode: String(result.mode ?? 'exclusive'),
+      owner: ownerName,
+      reason,
+      pid: process.pid,
+      host: os.hostname(),
+      createdAt: Number(result.createdAt ?? Date.now()),
+      expiresAt: Number(result.expiresAt ?? Date.now() + ttlMs),
+      entries: Array.isArray(result.entries) ? result.entries : [],
+      lockPath: Array.isArray(result.entries) && result.entries.length > 0
+        ? String(result.entries[0].lockPath ?? '')
+        : '',
+    }
+    held.set(record.id, record)
+    return record
   }
 
   // -------------------------------------------------------------- release
@@ -631,10 +783,22 @@ export function apply(ctx, config) {
     name: 'resource_acquire',
     description: 'Take a lease on a machine resource BEFORE using it. Use this whenever the work touches something only one agent may touch at a time: a browser, Playwright/Chromium instance or its user-data-dir; a fixed port (dev server, debug port, WebSocket); screen or input focus (driving the real desktop, taking desktop screenshots, sending keystrokes); or a shared write target (a directory, repository, or output folder other agents also write to). Leases are files under a lock root shared with the resource-lease CLI, so agents using the CLI and agents using this plugin exclude each other. Acquire, do the work, then call resource_release; the lease also expires by TTL, so a crashed holder cannot block a resource forever. The owner is set to the calling agent automatically. If the resource is busy the error names the current holder, its reason, and the remaining time.',
     parameters: {
+      resources: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: 'Resource key, category:subject.' },
+            mode: { type: 'string', enum: ['exclusive', 'shared', 'pool'], description: 'Arbitration mode for this resource; omit to use the configured default.' },
+            slots: { type: 'number', description: 'Concurrent holders for mode "pool".' },
+          },
+          required: ['key'],
+        },
+        description: 'Every resource this operation needs, acquired atomically: if any one is busy the whole request is rolled back and nothing is held. Prefer this over "key" whenever the work touches more than one thing (an output directory AND a port, a browser profile AND screen focus). Each item is {key, mode?, slots?}.',
+      },
       key: {
         type: 'string',
-        required: true,
-        description: 'Resource key, category:specific. Examples: "browser:chromium", "browser:profile:main", "port:9222", "screen:focus", "dir:src/parser", "repo:root". Keys are sanitized to [A-Za-z0-9._-] for the lock filename, so "browser:chromium" and "browser_chromium" are the same resource.',
+        description: 'Single-resource shorthand, equivalent to resources:[{key}]. Resource key, category:subject. Examples: "path:D:/out", "port:9222", "screen:focus", "browser:profile:work", "browser:instance", "proc:npm-install". Conflicts are decided on canonical facets, not on string equality, so "path:D:/out" and "path:D:/out/sub" conflict while "path:D:/out" and "path:D:/out2" do not.',
       },
       reason: {
         type: 'string',
@@ -661,25 +825,26 @@ export function apply(ctx, config) {
     output: {
       schema: outputSchema({
         id: { type: 'string', required: true, description: 'Lease id to pass to resource_release.' },
-        key: { type: 'string', required: true, description: 'The resource key that was leased.' },
+        key: { type: 'string', required: true, description: 'The primary resource key that was leased.' },
+        facets: { type: 'string', required: true, description: 'Comma-separated canonical facets this lease covers. These are what other agents actually conflict with, and there can be more of them than there were keys (a browser profile expands to its directory).' },
         mode: { type: 'string', required: true, description: 'Mode that was used.' },
-        slot: { type: 'number', required: true, description: 'Zero-based slot index; meaningful for mode "pool".' },
-        slots: { type: 'number', required: true, description: 'Total slots in the pool.' },
         owner: { type: 'string', required: true, description: 'Owner recorded on the lease (the calling agent).' },
         reason: { type: 'string', required: true, description: 'Reason recorded on the lease.' },
         expiresAt: { type: 'number', required: true, description: 'Epoch milliseconds at which the lease expires on its own.' },
         ttlMs: { type: 'number', required: true, description: 'Effective lease lifetime in milliseconds.' },
         waitedMs: { type: 'number', required: true, description: 'How long the acquire waited before succeeding.' },
-        lockPath: { type: 'string', required: true, description: 'The lock file that holds this lease.' },
+        lockPath: { type: 'string', required: true, description: 'The first lock file that holds this lease.' },
       }),
       render: textRender((v) => {
-        const pool = v.mode === 'pool' ? ` slot ${Number(v.slot) + 1}/${Number(v.slots)}` : ''
-        return `Lease ${v.id} acquired on "${v.key}" (${v.mode}${pool}), owner ${v.owner}, expires in ${Math.round(Number(v.ttlMs) / 1000)}s. Call resource_release with id="${v.id}" when the work is done.`
+        const facets = String(v.facets ?? '')
+        const extra = facets !== '' ? ` covering ${facets}` : ''
+        return `Lease ${v.id} acquired on "${v.key}" (${v.mode})${extra}, owner ${v.owner}, expires in ${Math.round(Number(v.ttlMs) / 1000)}s. Call resource_release with id="${v.id}" when the work is done.`
       }),
     },
     execute: async (args, exec) => {
       const started = Date.now()
-      const meta = await lease({
+      const record = await lease({
+        resources: args.resources,
         key: args.key,
         mode: args.mode,
         slots: args.slots,
@@ -689,17 +854,16 @@ export function apply(ctx, config) {
         owner: ownerOf(exec),
       })
       return {
-        id: String(meta.id),
-        key: String(meta.key),
-        mode: String(meta.mode),
-        slot: Number(meta.slot),
-        slots: Number(meta.slots),
-        owner: String(meta.owner ?? ''),
-        reason: String(meta.reason ?? ''),
-        expiresAt: Number(meta.expiresAt),
-        ttlMs: Number(meta.expiresAt) - Number(meta.createdAt),
+        id: String(record.id),
+        key: String(record.key),
+        facets: (Array.isArray(record.facets) ? record.facets : []).join(','),
+        mode: String(record.mode),
+        owner: String(record.owner ?? ''),
+        reason: String(record.reason ?? ''),
+        expiresAt: Number(record.expiresAt),
+        ttlMs: Number(record.expiresAt) - Number(record.createdAt),
         waitedMs: Date.now() - started,
-        lockPath: String(meta.lockPath ?? ''),
+        lockPath: String(record.lockPath ?? ''),
       }
     },
   })), 'dsh-resource-lease: tool resource_acquire')
