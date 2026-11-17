@@ -20,3 +20,8 @@
         #   'screen:focus': { mode: exclusive }
         # protectedTools:               # tool name -> resource that must be held
         #   pwsh: 'screen:focus'
+        # promptRules:                  # verbatim lines injected into EVERY prompt assembly.
+        #                               # Lives here, in the profile, so a plugin upgrade
+        #                               # cannot silently drop it. Empty means no injection.
+        #   - 'Re-read a resource once before concluding it is unavailable; say what you saw.'
+        #   - 'Replaying a non-idempotent action is forbidden; re-doing an idempotent observation is required.'

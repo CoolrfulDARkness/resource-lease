@@ -182,6 +182,18 @@ Resource leases in effect right now
 
 无租约时**不产生任何文本** —— 否则每个普通 agent 的 prompt 都被污染,白花 token。
 
+同一个注入通道还接了一件事:`promptRules`。操作者可以把**想无条件强调的短规则**填在 profile 配置里,插件每一轮逐字注入:
+
+```yaml
+config:
+  promptRules:
+    - 'Replaying a non-idempotent action is forbidden; re-doing an idempotent observation is required.'
+```
+
+为什么放配置而不是放文档:写进 `node_modules/` 的 markdown 只要没人读就等于零,而且**插件升级时会被覆盖掉、静默失效**;配置在 profile 里,升级不会碰它。这条区别有实测来源——见 [docs/COMPUTER-USE-PLAYBOOK.md](docs/COMPUTER-USE-PLAYBOOK.md) 的错误 4。
+
+数组为空时不注入任何东西。
+
 真正造成损失的往往不是"两个 agent 撞上了",而是"编排者不知道发生过撞车,继续基于错的前提调度"。
 
 ---

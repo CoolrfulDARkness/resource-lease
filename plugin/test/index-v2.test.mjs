@@ -94,7 +94,7 @@ test('registers the three tools with registry-valid schemas', () => {
   assert.deepEqual(resources.items.required, ['key'])
 
   assert.equal(guards.length, 1, 'exactly one guard must be installed')
-  assert.equal(contexts.length, 1, 'exactly one context provider must be installed')
+  assert.equal(contexts.length, 2, 'two providers: the lease context and the configured-rules context')
 
   fs.rmSync(root, { recursive: true, force: true })
 })
@@ -254,6 +254,33 @@ test('path conflicts respect segment boundaries, not string prefixes', async () 
     }),
     (error) => error.code === 'RESOURCE_BUSY',
   )
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('configured promptRules are emitted verbatim on every assembly', () => {
+  const root = tmpRoot()
+  const { ctx, contexts } = makeCtx()
+  apply(ctx, {
+    lockRoot: root,
+    promptRules: ['RULE ONE: re-read before concluding.', 'RULE TWO: reload once.'],
+  })
+
+  const rules = contexts.find((c) => c.name === 'resource-lease-rules')
+  assert.ok(rules, 'a dedicated rules provider must be registered')
+  assert.equal(rules.text({}), 'RULE ONE: re-read before concluding.\nRULE TWO: reload once.')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('with no promptRules the rules provider emits nothing at all', () => {
+  const root = tmpRoot()
+  const { ctx, contexts } = makeCtx()
+  apply(ctx, { lockRoot: root })
+
+  const rules = contexts.find((c) => c.name === 'resource-lease-rules')
+  assert.ok(rules, 'the provider is registered even when unused')
+  assert.equal(rules.text({}), '', 'an ordinary profile must pay zero prompt tokens')
 
   fs.rmSync(root, { recursive: true, force: true })
 })

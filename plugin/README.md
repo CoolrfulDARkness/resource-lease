@@ -40,8 +40,38 @@
 | `onTimeout` | `'fail'` \| `'queue'` \| `'steal'` | `'fail'` | 等待超时后的行为:`fail` 报出持有者;`queue` 一直等到拿到;`steal` 无视 TTL 强抢。无法识别的值回落 `fail` |
 | `resources` | `{ [key]: { mode, slots } }` | `{}` | 资源 key 的默认仲裁方式。`lease` 没指定 `mode` 时来这里查 |
 | `protectedTools` | `{ [toolName]: resourceKey }` | `{}` | 工具名 → 资源 key。未持该资源时调用被拒 |
+| `promptRules` | `string[]` | `[]` | 逐字注入**每一次**提示词装配的短规则。见 §2.1 |
 
 `cordis.patch.yml` 里的注释块列出了全部字段的写法,取消注释即可。
+
+### 2.1 `promptRules`:让规则扛得住升级
+
+有些约束你想让 agent **每一轮都看到**,而不是"去读某个文件"。这类约束有两个地方可放,代价完全不同:
+
+| 放哪 | 生效吗 | 插件升级后 |
+|---|---|---|
+| 写进 `node_modules/<plugin>/` 里的 markdown | 只要没人读就等于零 | **被覆盖掉**,静默失效 |
+| 写进测试里断言 | 只证明代码没坏 | 与 agent 行为无关 |
+| 工作目录里的 `AGENTS.md` | 只有被读到时才生效 | 通常活着,但取决于 agent 是否打开 |
+| **`promptRules`(填在 profile 的配置里)** | **每次装配都注入,无条件** | **活着**,因为它在 profile 配置里,不在包内 |
+
+`order: 126`,紧跟在租约上下文之后;`promptRules` 为空数组时**完全不注入**(普通 profile 不付任何代价)。
+
+它是个通用机制,不是为某个具体工具写的特例:任何"操作者想无条件强调"的短句都可以放这里。写法:
+
+```yaml
+config:
+  promptRules:
+    - 'Before concluding a resource is unavailable, re-observe it once and say what you saw.'
+    - 'Replaying a non-idempotent action is forbidden; re-doing an idempotent observation is required.'
+```
+
+几条实践约束(都来自踩坑):
+
+- **一条一行,写"做什么",不写"别做什么"。** 只写禁止会让 agent 把幂等的重做也一起禁掉——实测出现过"因为规则说不许重试,所以不再读第二次"。
+- **禁令必须写清作用域。** 「不要重试」这种无条件措辞会误伤「再读一次」;要写成「重放非幂等动作禁止;重做幂等观测必须」。
+- **规则是约束,不是沙箱。** 它靠提示词生效,不能保证 100% 遵守;需要**硬**保证时用 `protectedTools` 守卫(代码层拒绝)。
+- 别把长文档塞进来:它进的是每一轮的上下文,越长越贵。
 
 ### 配置示例
 

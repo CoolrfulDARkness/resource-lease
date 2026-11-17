@@ -58,6 +58,11 @@ const CONTEXT_ORDER = 125
 /** Prompt context name; also the registry key that scoped entries shadow. */
 const CONTEXT_NAME = 'resource-lease'
 
+/** Placement of the operator-configured rules. Right after our lease context. */
+const RULES_CONTEXT_ORDER = 126
+/** Distinct name so the two providers shadow independently. */
+const RULES_CONTEXT_NAME = 'resource-lease-rules'
+
 /**
  * No `Config` export on purpose.
  *
@@ -195,6 +200,20 @@ function normalizeConfig(raw) {
     }
   }
 
+  // Short rules this plugin injects into EVERY prompt assembly, verbatim.
+  //
+  // Why here: a document only changes behaviour if it is actually read, and the
+  // only place guaranteed to be read every turn is the system prompt. Rules an
+  // operator wants enforced unconditionally (not "consult this file") belong in
+  // configuration, not in a markdown file nobody opens. Keeping it a plain list
+  // of strings makes this a general mechanism rather than a computer-use hack.
+  const promptRules = []
+  if (Array.isArray(c.promptRules)) {
+    for (const rule of c.promptRules) {
+      if (typeof rule === 'string' && rule.trim() !== '') promptRules.push(rule.trim())
+    }
+  }
+
   // The CLI honours DSH_RESOURCE_TTL; only let it through when the row does
   // not set defaultTtlMs, so explicit configuration always wins.
   const ttlFromEnv = c.defaultTtlMs === undefined ? lock.toMs(process.env.DSH_RESOURCE_TTL, undefined) : undefined
@@ -215,6 +234,7 @@ function normalizeConfig(raw) {
     resources,
     protectedTools,
     aliases,
+    promptRules,
   }
 }
 
@@ -1011,6 +1031,14 @@ export function apply(ctx, config) {
     order: CONTEXT_ORDER,
     text: (assembly) => renderContext(assembly),
   }), 'dsh-resource-lease: runtime context')
+
+  // Configured rules, emitted verbatim on every assembly. Emits '' when the
+  // operator configured none, so an ordinary profile pays nothing.
+  ctx.effect(() => ctx.systemPrompt.context({
+    name: RULES_CONTEXT_NAME,
+    order: RULES_CONTEXT_ORDER,
+    text: () => (cfg.promptRules.length === 0 ? '' : cfg.promptRules.join('\n')),
+  }), 'dsh-resource-lease: configured rules')
 
   // ------------------------------------------------------------ 4. guard
 
