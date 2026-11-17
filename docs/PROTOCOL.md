@@ -23,6 +23,7 @@ DSH 只有**按 agent 数**的名额限制(`maxActiveSubagents`),没有**按资�
 | 起浏览器 / Playwright / `chromium.launch()` / 截图渲染,用固定 user-data-dir | `browser:profile:<名字>` | `exclusive` |
 | 只想限制「本机同时开几个 Chromium」 | `browser:instance` | `pool`(建议 slots=2) |
 | 连一个已在跑的调试端口 | `browser:cdp:<端口>` | `exclusive` |
+| 操作管道式浏览器(0.6.0 起的 DSH agent 浏览器,**不监听 TCP 端口**) | `browser:instance`(容器),保留登录再加 `path:<keptProfile>` | `exclusive` / `pool` |
 | 占固定端口(9222、3000…) | `port:<n>` 或 `port:<lo>-<hi>` | `exclusive` |
 | 需要屏幕/输入焦点(headed 操作、SendKeys、点窗口) | `screen:focus` | `exclusive` |
 | 只操作某一个窗口 | `window:hwnd:<十进制>` | `exclusive` |
@@ -129,7 +130,7 @@ expandFacets("browser:profile:work")
 | `path:D:/out` | `path:D:/out/sub` | ✅ | 祖先-后代 |
 | `path:D:/out` | `path:D:/out2` | ❌ | **按分段比较,不冲突** |
 | `port:9222` | `port:9220-9230` | ✅ | 区间重叠 |
-| `browser:cdp:9222` | `port:9222` | ✅ | cdp 端口 facet |
+| `browser:cdp:9222` | `port:9222` | ✅ | cdp 端口 facet —— **只对真的监听该 TCP 端口的浏览器成立**;管道式浏览器不产生 `port:` facet(见 §6.2 注 ②) |
 | `window:hwnd:197772` | `browser:instance` | ⚠️ | 契约未定,见 §6.2 注 ① |
 | `screen:focus` | `window:hwnd:197772` | ❌ | **故意不冲突**,见 §6.2 |
 
@@ -154,13 +155,17 @@ expandFacets("browser:profile:work")
 ### 6.2 跨 class 的蕴含(集中一张表,不许散落)
 
 - `browser:instance` ⟹ 与所有 `browser:*` 冲突(一个实例容器)
-- `browser:cdp:<p>` ⟹ 与 `port:<p>` 冲突
+- `browser:cdp:<p>` ⟹ 与 `port:<p>` 冲突 —— **只对真的监听该 TCP 端口的浏览器成立**(管道式浏览器没有端口可争,见注 ②)
 - `browser:profile:<n>` ⟹ 与 `path:<profileDir>` 冲突
 - `screen:focus` ⟹ 与 `window:*` **不冲突**。焦点是输入流,窗口是目标对象;两个 agent 可以各持不同窗口但都需要焦点,所以只串行化焦点。**让它们冲突会造成过度串行化。**
 
 > **后果是必须知道的:** 持 `window:hwnd:X` 不保证你的键盘进了 X;持 `screen:focus` 不保证你操作的是对的窗口。要往某窗口送输入 → **两个都拿**。
 
 > **注 ①:`window:hwnd:<n>` 与 `browser:instance` 的判定,契约还没给定论。** 契约 §3.1 的表里给它标了 ⚠️,但 §3.3 的蕴含表没有对应条目(蕴含表只写了 instance ⟹ 所有 `browser:*`、cdp ⟹ port、profile ⟹ path、focus ↛ window)。在契约补清之前按保守方式用:操作某个浏览器窗口时,把 `browser:instance`(或 `browser:profile:*`)、`window:hwnd:<n>`、`screen:focus` **一起声明**。宁可多占一个 facet,不要赌「反正是不同 class」。
+
+> **注 ②:`browser:cdp:<p>` ⟹ `port:<p>` 只对真的监听 TCP 调试端口的浏览器成立。** 没有端口的浏览器(管道式 —— 例如 `dsh-computer-use-win` 0.6.0 起的 agent 浏览器,用 `--remote-debugging-pipe` 走继承的 stdio)不产生 `port:<p>` facet,所以既不会被「有人占了 `port:<p>`」误挡,也不会误挡别人。
+> 这**不是漏判**:端口仲裁对管道式浏览器本来就无意义 —— 它没有端口可以争。要串行化它,用 `browser:instance`(容器,与所有 `browser:*` 冲突);保留登录的场景再加 `path:<keptProfile>` 保护配置目录。
+> 判断一个浏览器属于哪一类,只需要问一件事:**它有没有在监听 TCP 调试端口。** 有 → `browser:cdp:<port>`;没有 → `browser:instance`。不要拿 `health` 的 `endpoints` 字段当判据 —— 它只反映「有没有配置 `WCU_BROWSER_CDP_URL` 或已允许的用户浏览器」,为空不代表管道模式。
 
 ### 6.3 全序(多键获取的排序依据)
 

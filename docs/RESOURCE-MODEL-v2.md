@@ -76,6 +76,19 @@ rest     := 按 class 解析;除 path 外,subject 与 qualifier 以 ":" 分段
 | `api` | `api:<provider>:<metric>`,metric ∈ {rpm, tpm, concurrent} |
 | `named` | 原样小写,仅用于兜底 |
 
+**`browser:cdp:<port>` 的语义边界(2026-11 起必须分清):** 它表示「占用某个**真的在监听 TCP 调试端口**的浏览器」,
+不是「占用一个用 CDP 协议通信的浏览器」。两者不等价:
+
+| 浏览器 | 有 TCP 调试端口? | 该用什么键 |
+|---|---|---|
+| 自己起、启动参数带 `--remote-debugging-port=<n>` 的实例 | 有 | `browser:cdp:<n>`(+ 需要时 `path:<user-data-dir>`) |
+| 用户自己已打开、允许了远程调试的实例(插件「连接现有浏览器」、或 `WCU_BROWSER_CDP_URL`) | 有(它就是以调试端口启动的) | `browser:cdp:<port>`,按**独占单例**用 |
+| **dsh-computer-use-win 0.6.0 起的 agent 浏览器** | **没有** | **`browser:instance`** |
+
+最后一行是可核事实:该插件 0.6.0 启动 agent 浏览器时传的是 `--remote-debugging-pipe`,
+用继承的 stdio 管道(Chromium 的 DevTools pipe)通信,不建 TCP 监听;不传 `--remote-debugging-port`。
+所以对管道式浏览器写 `browser:cdp:<port>` **既保护不了它,也挡不住别人**。
+
 `sanitizeKey()` 只负责把 canonical key 变成**文件名安全**的串(映射非法字符、限长、加短哈希),**不参与语义判等**。语义判等永远用 canonical key。
 
 ### 2.1 v1 键名的迁移(必须显式,不许静默)
@@ -143,6 +156,12 @@ expandFacets("browser:profile:work")
 
 **`path` 的祖先判定必须按路径分隔符分段**,`D:/out` 与 `D:/out2` 不冲突。这是 v1 最容易写错的地方。
 
+> **上表第 4 行(`browser:cdp:9222` ⟹ `port:9222`)只对真的监听端口的浏览器成立。**
+> 这条 facet 是从「这个浏览器占着端口 `<p>`」推出来的;管道式浏览器(见 §2 的语义边界,
+> 例如 dsh-computer-use-win 0.6.0 起的 agent 浏览器)根本不占端口,**不产生 `port:<p>` facet**。
+> 于是拿 `port:<p>` 的 agent 不会误挡它,它也挡不住别人 —— 这不是漏判,是「没有可仲裁的端口」。
+> 要串行化管道式浏览器,用 `browser:instance` 或 `browser:profile:<kept profile>`。
+
 ### 3.2 冲突谓词
 
 对 facet `fa`(已被 A 以模式 `ma` 持有)与 `fb`(B 想以模式 `mb` 获取):
@@ -182,9 +201,14 @@ lock.js 的准入逻辑因此是两层:`facetsConflict` 做 exclusive/shared 预
 少数跨类冲突必须显式编码,否则会漏:
 
 - `browser:instance` ⟹ 与所有 `browser:*` 冲突(一个实例容器)
-- `browser:cdp:<p>` ⟹ 与 `port:<p>` 冲突
+- `browser:cdp:<p>` ⟹ 与 `port:<p>` 冲突。**边界:只对真的监听那个 TCP 调试端口的浏览器成立。** 没有端口的浏览器(管道式,如 0.6.0 起的 agent 浏览器)不产生 `port:<p>` facet,因此不会被「占了 `port:<p>`」误挡,也不会误挡别人 —— 端口仲裁对它无意义,不是漏判。要串行化它就用 `browser:instance`。管道名每次启动随机(`\\.\pipe\dsh-wcu-cdp-<32 hex>`),不可预先声明,所以**不引入 `browser:pipe:<name>` 这类键**
 - `browser:profile:<n>` ⟹ 与 `path:<profileDir>` 冲突(§3.1)
 - `screen:focus` ⟹ 与 `window:*` 冲突吗?**不。** 焦点是输入流,窗口是目标对象;两个 agent 可各持不同窗口但都需要焦点 → 焦点本身由 `screen:focus` 串行化。**不要**让 `screen:focus` 与 `window:*` 冲突,否则会过度串行化。
+
+> **`browser:instance` 仍然覆盖所有 `browser:*`,上面那条边界不影响它。** 实例是容器:
+> 里面跑的是端口型还是管道型浏览器都无所谓,`browser:instance` 与
+> `browser:profile:*` / `browser:cdp:*` / `browser:origin:*` 都冲突。
+> 所以「我不管它是哪一种浏览器,先排他」的正确键是 `browser:instance`,这也是管道型浏览器唯一可靠的排他键。
 
 > 蕴含关系集中定义在 `resources.js` 的一个表里,**不允许散落在调用点**。新增一类资源时只改这张表。
 

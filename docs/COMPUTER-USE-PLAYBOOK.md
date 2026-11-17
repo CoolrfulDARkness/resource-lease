@@ -17,6 +17,9 @@
 6. resource_release
 ```
 
+> **网页内容不要用坐标去点。** 反过来更好:传 `browserTab`(`list_windows` 给的页面 tab id)
+> 在后台读/操作,不占屏幕焦点、不动鼠标。0.6.0 起的 DSH 浏览器**没有调试端口**,不要去找它(见 §8)。
+
 ---
 
 ## 1. 四条最容易犯的错(按危害排序)
@@ -280,7 +283,70 @@ resource_release id=<lease id>
 
 ---
 
-## 8. 完整的"发一篇长文"流程(实测跑通)
+## 8. 浏览器通道:不要再找调试端口(0.6.0 起)
+
+> 这一节替换「用 `--remote-debugging-port` 去连 DSH 浏览器」的旧思路。
+> 0.6.0 起它**不监听 TCP 调试端口**,所以没有可连的地址 —— 那条路不存在了,不是配置问题。
+
+**可核事实(本机 0.6.0):** 插件启动 agent 浏览器时传的是 `--remote-debugging-pipe`,
+用继承的 stdio 管道通信,不建 TCP 监听;`health` 的 `browserLane` 会给出
+`agentBrowser`(程序路径)、`agentProfile`(配置目录)、`keepSignIns`、`endpoints`、`connected`,
+但**没有可连的调试端口**。
+
+**别去翻 `DevToolsActivePort`**:在保留登录的配置目录里,这个文件的第一行是 `0`、第二行是
+`devtools/pipe/<随机名>/...` 的路由 —— 端口位是 0,那是管道地址,不是 TCP 端口,而且每次启动都变。
+
+`endpoints` 和 `connected` 要读准:
+
+| 字段 | 是什么 | 空数组说明什么 |
+|---|---|---|
+| `endpoints` | **可附加的浏览器候选**(用 `WCU_BROWSER_CDP_URL` 配置的地址,或你自己打开且允许了远程调试的浏览器) | 没有可附加的外部浏览器。**不是**「插件坏了」,也**不是**端口清单 |
+| `connected` | 当前已连上的浏览器 | 现在没有外部浏览器被连上 |
+
+### 操作网页的正路:`browserTab`
+
+```
+1. list_windows                                  → 拿到页面标签的 tab id
+2. 把 tab id 当 browserTab 传给:
+   snapshot / accessibility_tree / find / type_text / keypress / scroll / screenshot / wait_for
+3. 网页元素各有 element id(形如 t1a2b:57),直接交给:
+   click / set_value / focus / invoke / scroll
+```
+
+- 这些操作**在浏览器内部完成**:不移动桌面鼠标、不占剪贴板、不把窗口切前台,后台标签页同样能操作。
+- 传了 `browserTab` 时,坐标按**页面截图的 CSS 像素**算,可以点 canvas。
+- element id 只对读到它的那个页面有效:页面跳转后要重新读,复用旧 id 会 stale。
+- `Ctrl+L`、`Ctrl+T` 这类**浏览器自身**的快捷键网页内部收不到,别指望用 `browserTab` 发;
+  用 `address` / `new-tab` 代替。
+
+### 什么时候才回到桌面那一套
+
+只有需要**窗口级**键盘鼠标时(浏览器自己的快捷键、系统对话框、不属于网页的元素)才用:
+`list_windows` → 目标 `window:hwnd:<n>` → `screen:focus` 租约(见 §7)。
+
+### 连用户自己的浏览器:它是另一类,而且要走用户授权
+
+插件「连接现有浏览器」是实验特性:用户要先在 `chrome://inspect/#remote-debugging`
+(Edge 是 `edge://inspect/#remote-debugging`)里允许远程调试,之后每次连接浏览器都会问用户。
+**这类实例有端口**(用户自己的浏览器是以调试端口启动的),所以资源键是 `browser:cdp:<port>`,
+而且必须当**独占单例**用:那是用户的真实会话,两个人同时操作会互相抢页面。
+
+### 一张表分清
+
+| 你想动的东西 | 用什么 |
+|---|---|
+| DSH 自己的 agent 浏览器里的网页 | `browserTab` + 页面 element id;资源键用 `browser:instance`,不必 `screen:focus` |
+| 自己起的、带 `--remote-debugging-port` 的实例 | `browser:cdp:<port>`,按端口连 |
+| 用户自己已登录的实例 | `browser:cdp:<port>`,独占单例,且先拿到用户授权 |
+| 真实窗口的键鼠 | `screen:focus`(+ 必要时 `window:hwnd:<n>`) |
+
+> **一个容易混的点:** 带 `browserTab` 的网页操作技术上**不需要**屏幕焦点(它不动你的鼠标),
+> 但如果宿主把 `click`/`type_text` 登记进了 `protectedTools`,守卫仍会按**工具名**要租约(见 §7)。
+> 那是宿主的策略,不是技术必需 —— 拿租约照做即可,别为了绕开它去改操作方式。
+
+---
+
+## 9. 完整的"发一篇长文"流程(实测跑通)
 
 ```
 1. 恢复窗口(ShowWindow 9)+ SetForegroundWindow
@@ -300,7 +366,7 @@ resource_release id=<lease id>
 
 ---
 
-## 9. 出问题时的诊断顺序
+## 10. 出问题时的诊断顺序
 
 ```
 1. 窗口真的可见吗?  → Win32 IsWindowVisible + IsIconic + GetWindowRect
@@ -322,7 +388,7 @@ Element 'uia:rt:...' is stale or was not observed by this backend.
 
 ---
 
-## 10. 一句话总结
+## 11. 一句话总结
 
 > 这个工具报 `ok: true, verification: "sent"` 只说明**它的代码跑完了**,
 > 不说明**事情做成了**。

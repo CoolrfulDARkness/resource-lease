@@ -23,9 +23,9 @@
 
 | 我要做 | 声明 | mode | TTL 建议 |
 |---|---|---|---|
-| 起浏览器跑自动化 / 截图渲染 | `browser:profile:<name>` | `exclusive` | 120–300s |
-| 只是想限制「本机同时开几个 Chromium」 | `browser:instance` | `pool`,slots=2 | 与宿主会话同寿 |
-| 连已有的 Chrome 调试端口 | `browser:cdp:9222` | `exclusive` | 与宿主会话同寿 |
+| 用 DSH 插件自己的 agent 浏览器跑网页任务 | `browser:instance`(0.6.0 起它**没有调试端口**) | `pool`,slots=2 | 与宿主会话同寿 |
+| 自己 `--remote-debugging-port` 起浏览器,用固定 user-data-dir | `browser:profile:<name>` | `exclusive` | 120–300s |
+| 连一个**真的在监听调试端口**的浏览器(自建 fleet / 用户已登录实例) | `browser:cdp:<port>` | `exclusive` | 与宿主会话同寿 |
 | 往真实 GUI 里打字、点按钮 | `screen:focus`(+ 必要时 `window:hwnd:<n>`) | `exclusive` | 900–1800s |
 | 起 dev server | `port:<n>` | `exclusive` | 1800–3600s |
 | 装依赖 / 构建 / 跑测试 | `path:<仓库根>` + `proc:npm-install` | `exclusive` | 600–1800s |
@@ -38,28 +38,48 @@
 
 ## 2. 场景一:跑 Playwright / 浏览器自动化
 
-### 声明什么
+### 先分清三类浏览器,它们的键不一样
+
+**这是 0.6.0 之后最容易写错的一节。** 同样是「操作浏览器」,三类的资源键不同,因为连接方式不同:
+
+| 哪一类浏览器 | 怎么认出来 | 该声明什么 | 为什么 |
+|---|---|---|---|
+| **A. DSH 插件自己的 agent 浏览器**(0.6.0 起) | 你没有自己 launch,是 `windows_computer_use_*` 工具在用它;`health` 的 `browserLane` 给出 `agentBrowser` / `agentProfile` | **`browser:instance`**(要名额就用 `pool`) | 0.6.0 起它以 `--remote-debugging-pipe` 启动、走继承的 stdio 管道,**不监听 TCP 调试端口** → `browser:cdp:<port>` 对它不适用 |
+| **B. 自己用 `--remote-debugging-port` 起的实例** | 启动参数里有 `--remote-debugging-port=<n>`;`tools\browser-fleet.ps1`、`tools\cdp-read.ps1`、`tools\parallel-read.mjs` 这一套 | **`browser:cdp:<n>`**,按需再加 `path:<user-data-dir>` | 它真的有端口,CDP 就是按端口连的;`browser:cdp:<n>` 会展开出 `port:<n>` 的 facet |
+| **C. 连你自己已打开、已登录的实例** | 插件「连接现有浏览器」打开,或用 `WCU_BROWSER_CDP_URL` 指向一个 `ws://` CDP 地址 | **`browser:cdp:<port>`**,**独占单例** | 一个已登录的浏览器只有一份会话;两个人同时操作会互相抢同一个页面 |
+
+> **判断标准只看一件事:它有没有在监听 TCP 调试端口。** 有端口 → `browser:cdp:<port>`;没端口 → `browser:instance`。
+> 不要因为「我用的是 CDP 协议」就写 `browser:cdp:` —— **A 类也用 CDP**,只是跑在继承管道上,没有端口。
+
+> **A 类打开「保留网站登录」时会多一个可保护的目录。** 那时 `health` 的 `browserLane` 会多出 `keptProfile`
+> (本机当前 `keepSignIns:false`,所以实测的 health 里没有这个字段)。除了 `browser:instance`,
+> 还可以加 `path:<keptProfile>` 保护这份保留登录的配置目录。
+
+资源键之外还有按键鼠的那一层:
 
 | 你的做法 | 键 | 说明 |
 |---|---|---|
-| 用某个固定 user-data-dir | `browser:profile:<name>` | 会展开出该目录的 path facet,这是最关键的一个 |
-| 用临时 profile,但要求「本机最多 N 个浏览器」 | `browser:instance` | 容量类;实例是容器,与所有 `browser:*` 冲突 |
-| 连一个已经在跑的调试端口 | `browser:cdp:9222` | 自动带出 `port:9222` 的 facet,所以你不必再单独声明端口 |
+| 用某个固定 user-data-dir 起浏览器(B 类或自己 launch) | `browser:profile:<name>` | 会展开出该目录的 path facet,这是最关键的一个 |
 | 需要真实键鼠(headed、点窗口、SendKeys) | 再加 `screen:focus` | 输入流是全局唯一的,见下面的坑 |
 | 明确只操作某一个窗口 | 再加 `window:hwnd:<十进制>` | 目标对象,与焦点是两件事 |
+| 只是读/操作网页(传 `browserTab`) | **不必**加 `screen:focus` | 网页操作在浏览器内部完成,不动桌面鼠标;但若宿主把 `click`/`type_text` 绑进了 `protectedTools`,守卫仍会按**工具名**要求 `screen:focus` —— 那是宿主策略,不是技术必需 |
 
 ### mode
 
-- `browser:profile:*` → **`exclusive`**。同一个 user-data-dir 两个进程同时开,后果是 profile 被写坏或第二个进程静默连到第一个实例上(静默劫持,最难查)。
-- `browser:instance` → **`pool`**。这才是「N 个 agent 各起一个 Chromium 把内存打满」的正解:把「几个」变成显式名额,第三人直接失败,而不是大家一起变慢然后工具超时。
-- `screen:focus` → **`exclusive`**,只在你真的要往 GUI 里送输入时拿。headless 不需要。
+- `browser:instance` → **`pool`**(slots 由全员约定)。它既是「N 个 agent 各起一个浏览器把内存打满」的正解(把「几个」变成显式名额,第三人直接失败,而不是大家一起变慢然后工具超时),**也是默认情况下唯一能覆盖 A 类的键** —— A 类每次用临时 profile(目录名带进程号,事先不可知),没有可声明的 profile 键;而实例是容器,与所有 `browser:*` 冲突。
+- `browser:profile:<name>` → **`exclusive`**。同一个 user-data-dir 两个进程同时开,后果是 profile 被写坏,或第二个进程静默连到第一个实例上(静默劫持,最难查)。
+- `browser:cdp:<port>` → **`exclusive`**。一个调试端口只可能被一个驱动方接管;它同时挡住 `port:<port>` 的持有者(蕴含关系)。
+- `screen:focus` → **`exclusive`**,只在你真的要往 GUI 里送输入时拿。
 
 ### TTL
 
 - 脚本型(打开、抓取、截图、关闭):**120–300s**。
 - 人工节奏的填表/发布(长文、多重验证、等用户确认):**900–1800s**。实测填一篇长文 + 截图核对 + 发布要 5–15 分钟;给 300s 会在填一半时过期,然后下一次点击被守卫拒绝。
+- C 类(用户已登录实例):按整个任务给,别按单次点击给 —— 断线重连可能要用户重新授权。
 
 ### 典型冲突
+
+profile 型(挡住你的是目录,不是你写的名字):
 
 ```
 BLOCKED on browser:profile:work
@@ -69,12 +89,24 @@ BLOCKED on browser:profile:work
 建议: 改用 browser:profile:scratch 另开一个 profile,或排到 agent-a 之后
 ```
 
-注意冲突 facet 报的是 **path**,不是你写的 `browser:profile:work` —— 因为挡住你的是别人的 profile 目录锁。这正是 facet 模型的用处:你不会因为「名字不一样」而误判成没冲突。
+端口型(挡住你的是端口,不是你写的 browser 键):
 
-### 两个必须知道的坑
+```
+BLOCKED on browser:cdp:9222
+冲突 facet: port:9222
+持有者: agent-c   pid=7788   host=PC-01   reason=榜单抓取(自建实例)   剩余 96s
+我的任务: agent-d 复用同一个调试端口
+建议: 换个端口起自己的实例(--remote-debugging-port=9223),不要抢同一个
+```
 
-- **临时 profile 不撞 profile 锁,但撞容量。** 每次 `chromium.launch()` 都用新临时目录,profile 维度确实没人跟你抢;但 N 个 Chromium 同时跑会把内存和 60s 工具超时打爆。这种「谁也没占锁,但机器死了」的场景只能由 `browser:instance` 的 pool 表达。
-- **headless 也要声明 profile 锁。** headless 只是没有焦点问题,profile 目录、端口、容量照样冲突。
+冲突 facet 可能报 **path**,也可能报 **port** —— 取决于你是哪一类浏览器。这正是 facet 模型的用处:不会因为「名字不一样」而误判成没冲突。
+
+### 四个必须知道的坑
+
+- **0.6.0 的 agent 浏览器找不到调试端口,那不是坏了。** 它走继承管道、不监听 TCP。如果你去翻它的配置目录:`DevToolsActivePort` 的第一行是 **`0`**、第二行是 `devtools/pipe/...` 的路由 —— 端口位就是 0,那是管道地址,不是可连的 TCP 端口,而且每次启动都不一样(打开「保留网站登录」时,这个文件由插件自己写入)。要操作它的网页就用 `browserTab`(`list_windows` 拿到页面 tab id)。
+- **`browser:cdp:<port>` 挡不住 A 类,也保护不了它。** 它没有端口 → 不产生 `port:` facet → 你声明 `port:9222` / `browser:cdp:9222` 与它毫无关系。要它排他就用 `browser:instance`。
+- **临时 profile 不撞 profile 锁,但撞容量。** 插件自己的 agent 浏览器每次用临时 profile(目录名带进程号),profile 维度确实没人跟你抢;但 N 个浏览器同时跑会把内存和 60s 工具超时打爆。这种「谁也没占锁,但机器死了」的场景只能由 `browser:instance` 的 pool 表达。
+- **headless 也要声明。** headless 只是没有焦点问题,profile、容量、端口(如果有)照样冲突。
 
 ---
 
@@ -339,6 +371,7 @@ BLOCKED on api:openai:rpm
 1. **v1 的老类名(`dir:` / `repo:root` / `browser:chromium`)在 v2 已不是合法类。** 本手册一律改用 `path:` / `browser:profile:*` / `browser:instance`。老配置里残留的老键要么直接报错、要么落成某个 `named`,两种都不会和任何人互斥 —— 而**契约还没明确到底是哪一种**,这一点必须定。
 2. **`browser:profile:<name>` → 目录 的映射从哪来** 没写。展开 facet 需要「profile 名 → 绝对路径」这张表,契约只说结果不说来源(配置字段?探测?)。本手册按「配置里有这张表」写。
 3. **`proc:` 带限定符时的判定** 没写。`proc:npm-install:repo-a` 与 `proc:npm-install:repo-b` 是否冲突,取决于 subject 是否包含限定符;契约只写了「相等」。本手册一律用不带限定符的作业名(更保守,更串行)。
+4. **要不要为管道式浏览器新增 `browser:pipe:<name>` 这类键?判断:不要。** 管道名每次启动随机生成(`\\.\pipe\dsh-wcu-cdp-<32 hex>`),不可预先声明,也拿不到稳定名字,做成键只会是一串没人猜得中的字符串。只需要契约把「管道型浏览器不产生 port facet、只受 `browser:instance` / `browser:profile:` 约束」写成明文 —— 契约 §3.3 已按这个结论补上边界说明。
 
 ---
 
@@ -350,6 +383,8 @@ BLOCKED on api:openai:rpm
 | **以为 `shared` 能防写冲突** | `shared` 只表达「读意图」,冲突谓词里 `shared`+`shared` 是**放行**的。两个都要写的 agent 都用 `shared` = 纯裸奔,写得七零八落也没人挡。而且磁盘上 `shared` 仍占一个单锁文件,你还会意外串行化 | 会写就用 `exclusive`;要并发读就用 `pool` 或干脆不声明读 |
 | **把 `screen:focus` 和 `window:<hwnd>` 混为一谈** | 焦点是**输入流**(键盘鼠标发到前台那个窗口),窗口是**目标对象**。它们故意不冲突。只拿 `window` 的人可能一打字打进别人的窗口;只拿 `screen:focus` 的人可能操作了错误的窗口 | 要往某窗口送输入 → **两个都拿**,一次 acquire |
 | **用一个键干所有事**:所有浏览器操作都只声明 `browser:instance` | 它只表达「实例容器」,不区分 profile。两个 agent 各拿一个实例名额,却指向**同一个 user-data-dir**,profile 照样被写坏 | profile 锁(`browser:profile:*`)+ 容量锁(`browser:instance` pool)一起拿 |
+| **以为 `browser:cdp:9222` 能保护 DSH 自己的 agent 浏览器** | 0.6.0 起那个浏览器用 `--remote-debugging-pipe`,不监听 TCP 端口 → 不产生 `port:` facet。你写的 `browser:cdp:9222` 与它**毫无关系**,既挡不住别人也保护不了它 | 管道型用 `browser:instance`;只有真的带 `--remote-debugging-port` 的实例才用 `browser:cdp:<port>` |
+| **0.6.0 之后去找 agent 浏览器的调试端口** | 找不到不是配置问题,是它不再开端口。翻 `DevToolsActivePort`、试 9222 都是死路,还会把「连不上」误判成插件坏了 | 操作网页用 `browserTab`(从 `list_windows` 拿 tab id),资源键用 `browser:instance` |
 | **多键分几次 acquire** | 拿到第一个键、第二个键被人占了 → 你已经持有一半资源,又不敢继续,最后忘了释放。这就是死锁和锁泄漏的标准生成方式 | 位置参数一次给全:`acquire path:D:/out port:9222 --reason "构建"` |
 | **锁到文件级路径** | 对方新建一个文件不在你的锁范围内;列目录/删目录也不在 | 锁**公共祖先目录** |
 | **TTL 按平均值给** | 跑到一半过期 → 被接管 → 两个持有者同时写。这是本设计里唯一能造成**数据损坏**的用法 | 按最坏情况给;常驻进程用 `run` |
@@ -357,12 +392,7 @@ BLOCKED on api:openai:rpm
 
 ---
 
-## 13. 一句话
-
-> 声明要**宽一点**(公共祖先把整片都罩住),TTL 要给**足一点**,多键要**一次拿完**。
-> 反过来做的每一种,都对应上面「常见误用」里的某一行。
-
-## 场景 8:多个 agent 各写不同网站
+## 13. 场景八:多个 agent 各写不同网站
 
 **该声明**:`browser:origin:<host>`,每个 agent 一个站点。
 
@@ -385,3 +415,10 @@ Resource busy: browser:origin:zhihu.com held by agent-a (8s left, reason: 发文
 
 **坑**:不要在这里申请 `browser:instance` —— 实例是容器,会挡住所有 origin,
 把本可以并行的分片任务重新串起来。
+
+---
+
+## 14. 一句话
+
+> 声明要**宽一点**(公共祖先把整片都罩住),TTL 要给**足一点**,多键要**一次拿完**。
+> 反过来做的每一种,都对应上面「常见误用」里的某一行。

@@ -96,7 +96,7 @@ v2 增加了一条实现纪律(不是新原则,是原则 2 的延伸):
 
 | 类型 | 例子 | 租约模式 | 撞车形态 | v2 里怎么写 |
 |---|---|---|---|---|
-| **A 独占单例** | 浏览器 user-data-dir、固定 CDP 端口、单例 app、**屏幕/输入焦点**、串口 | `exclusive`(slots=1) | 硬失败,或静默劫持(连上了但操作别人的东西) | `browser:profile:*` / `browser:cdp:<p>` / `port:<n>` / `screen:focus` / `window:hwnd:<n>` |
+| **A 独占单例** | 浏览器 user-data-dir、固定 CDP 端口、单例 app、**屏幕/输入焦点**、串口 | `exclusive`(slots=1) | 硬失败,或静默劫持(连上了但操作别人的东西) | `browser:profile:*` / `browser:cdp:<p>`(仅端口型) / `port:<n>` / `screen:focus` / `window:hwnd:<n>`,**管道式浏览器整台**用 `browser:instance` |
 | **B 容量** | CPU/内存/GPU、Chromium 实例数、API RPM/TPM、并发连接 | `pool(slots: N)` | 不失败,退化成慢 → 超时 → OOM → 429 | `browser:instance`(pool)/ `api:<provider>:<metric>`(pool) |
 | **C 共享可变状态** | 同一 cwd 文件、git index、数据库、共享写目标 | `exclusive`,键为路径祖先 | 静默污染:成功返回但结果错 | `path:<绝对路径>`(祖先 facet) |
 
@@ -125,7 +125,7 @@ expandFacets("browser:profile:work")
 | `path:D:/out` | `path:D:/out/sub` | ✅ | 祖先-后代 |
 | `path:D:/out` | `path:D:/out2` | ❌ | 祖先判定必须**按路径分隔符分段** |
 | `port:9222` | `port:9220-9230` | ✅ | 区间重叠 |
-| `browser:cdp:9222` | `port:9222` | ✅ | cdp 端口 facet |
+| `browser:cdp:9222` | `port:9222` | ✅ | cdp 端口 facet —— **只对真的监听该 TCP 端口的浏览器成立** |
 | `window:hwnd:197772` | `browser:instance` | ⚠️ | 契约标了 ⚠️ 但蕴含表未给判定(见 §6 注) |
 
 三条设计约束:
