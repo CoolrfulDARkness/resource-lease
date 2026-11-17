@@ -891,7 +891,7 @@ function modelFn(name) {
  * symbolic-link resolution, §10). On Windows that leaves THREE ways for one
  * directory to carry two different canonical keys:
  *
- *   1. 8.3 short names: C:\Users\ALIENA~1\Temp vs C:\Users\Alienation\AppData\Local\Temp
+ *   1. 8.3 short names: C:\Users\JOHNDO~1\Temp vs C:\Users\JohnDoe\AppData\Local\Temp
  *      -- note the short name can also fold an unparented path segment, and this
  *      machine's own %TEMP% is such a path, so this is not hypothetical;
  *   2. symlinks and directory junctions;

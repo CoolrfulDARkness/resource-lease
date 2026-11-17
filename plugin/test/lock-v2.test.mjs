@@ -1000,8 +1000,8 @@ test('KNOWN LIMITATION §2/§8: an 8.3 short path and its long name are NOT the 
   //
   // Empirically on this platform: fs.realpathSync.native() resolves 8.3 -> long names
   // and junctions, while fs.realpathSync() does NOT resolve 8.3.
-  const shortKey = 'path:C:/Users/ALIENA~1/AppData/Local/Temp/out'
-  const longKey = 'path:C:/Users/Alienation/AppData/Local/Temp/out'
+  const shortKey = 'path:C:/Users/JOHNDO~1/AppData/Local/Temp/out'
+  const longKey = 'path:C:/Users/JohnDoe/AppData/Local/Temp/out'
   assert.notEqual(facetOf(shortKey), facetOf(longKey), 'documented gap: aliases are distinct facets')
 
   const root = freshRoot()

@@ -125,7 +125,7 @@ BLOCKED on port:3000
 ### 声明什么
 
 ```powershell
-$LEASE = "D:\Banking Buddy\.dsh-im\resource-lease\cli\lease.ps1"   # 后面几个场景都复用这个变量
+$LEASE = "./cli/lease.ps1"   # 后面几个场景都复用这个变量
 
 & $LEASE acquire "path:D:/repo" "proc:npm-install" --ttl 900s --reason "装依赖"
 ```

@@ -350,9 +350,9 @@ test('§3.3.1 alias priority: explicit > configured, and profileDirs still works
 })
 
 test('§3.3.1 an alias may tie ANY key to a directory (repo:root -> the repo path)', () => {
-  const aliases = { 'repo:root': 'D:\\Banking Buddy\\.dsh-im' }
-  assert.deepEqual(expandFacets('repo:root', aliases), ['repo:root', 'path:d:/banking buddy/.dsh-im'])
-  assert.equal(keysConflict('repo:root', 'exclusive', 'path:D:/Banking Buddy', 'exclusive', aliases), true)
+  const aliases = { 'repo:root': 'D:\\work\\app' }
+  assert.deepEqual(expandFacets('repo:root', aliases), ['repo:root', 'path:d:/work/app'])
+  assert.equal(keysConflict('repo:root', 'exclusive', 'path:D:/work', 'exclusive', aliases), true)
   // Optional by design: a key without an alias is not an "unresolved" hole.
   assert.deepEqual(unresolvedAliases('repo:root'), [])
   // Alias keys are canonicalised, so a differently-cased alias key still matches.

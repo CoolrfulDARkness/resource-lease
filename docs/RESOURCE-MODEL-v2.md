@@ -418,8 +418,8 @@ resource_status({ key? , owner? })
    所以 v2.0 的 `shared` 实际仍是单持有者(v1 行为),**真正的多读者需要"每持有者一个文件"
    或"一个文件多记录"的存储变更,尚未实现**。
    需要并发只读时,当前正确做法是用 `pool` 给出 N 个名额,而不是 `shared`。
-7. **8.3 短文件名与符号链接/目录联接不归一。** `path:C:\Users\ALIENA~1\x` 与
-   `path:C:\Users\Alienation\x` 指向同一目录,但 canonical 形不同 → 互斥静默失效。
+7. **8.3 短文件名与符号链接/目录联接不归一。** `path:C:\Users\JOHNDO~1\x` 与
+   `path:C:\Users\JohnDoe\x` 指向同一目录,但 canonical 形不同 → 互斥静默失效。
    不解析符号链接是为了避开 TOCTOU(解析与使用之间存在竞态),这个取舍保留;
    **同一资源必须由调用方用同一写法**。跨 agent 协作时建议统一用长名绝对路径。
 

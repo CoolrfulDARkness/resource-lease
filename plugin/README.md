@@ -20,7 +20,7 @@
 
 ## 1.1 自包含(为什么没有任何 `@deepseek-ai/*` import)
 
-`install_bundle` 安装本地目录时用的是**符号链接**(`profile\node_modules\dsh-resource-lease` → 本目录),而 Node 按**真实路径**解析裸模块名。也就是说它从 `D:\Banking Buddy\...` 一路往上找,永远到不了 profile 的 `node_modules`,更到不了 `app.asar` 里 DSH 自带的 `@deepseek-ai/*`。
+`install_bundle` 安装本地目录时用的是**符号链接**(`profile\node_modules\dsh-resource-lease` → 本目录),而 Node 按**真实路径**解析裸模块名。也就是说它从本目录的真实位置一路往上找,永远到不了 profile 的 `node_modules`,更到不了 `app.asar` 里 DSH 自带的 `@deepseek-ai/*`。
 
 所以本插件的 `lib/*.js` **只 import `node:` 内建模块和同目录的 `./lock.js`**;动态 `import()` 也不行(同样解析不到),同样没有。代价是两个:
 

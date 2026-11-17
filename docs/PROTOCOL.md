@@ -40,7 +40,7 @@ DSH 只有**按 agent 数**的名额限制(`maxActiveSubagents`),没有**按资�
 ## 3. 三步走(照做就行)
 
 ```powershell
-$LEASE = "D:\Banking Buddy\.dsh-im\resource-lease\cli\lease.ps1"
+$LEASE = "./cli/lease.ps1"
 
 # 1) 申请。多个键一次给全,别分几次拿。抢不到就退出码 2,别硬闯。
 & $LEASE acquire path:D:/out port:9222 --ttl 300s --reason "构建产物 + 本地预览"
@@ -406,7 +406,7 @@ BLOCKED on path:D:/out
 
 1. **派活前先看盘**:
    ```powershell
-   & "D:\Banking Buddy\.dsh-im\resource-lease\cli\lease.ps1" status
+   & "./cli/lease.ps1" status
    ```
 2. **在任务里声明资源**,让冲突在派活前就暴露,而不是开工后才炸:
    ```

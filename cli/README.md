@@ -3,7 +3,7 @@
 不装插件、不改 DSH,今天就能用。跨进程文件锁,带 TTL 与崩溃自愈。
 
 ```powershell
-$LEASE = "D:\Banking Buddy\.dsh-im\resource-lease\cli\lease.ps1"
+$LEASE = "./cli/lease.ps1"
 & $LEASE help
 ```
 
@@ -109,7 +109,7 @@ port:9222        exclusive   def-208 调试端口     8s     9912
 ## 测试
 
 ```powershell
-& "D:\Banking Buddy\.dsh-im\resource-lease\cli\tests\test-lease.ps1"
+& "./cli/tests/test-lease.ps1"
 ```
 
 37 项(含 20 组 v1 用例 + 17 组 v2 用例下的 **207 条断言**),全部真起子进程(不是假 job),覆盖:独占互斥、跨进程竞争、TTL 接管、崩溃残留自愈(造真实 `.lock` 文件残骸并断言 `.stale` 计数 0→1)、pool 名额、`run` 异常释放、退出码、以及三条回归:**接管后旧 id 释放不误删新锁**、**`run` 中途被接管不误删**、**键大小写归一 / 半写锁文件不可抢**。
