@@ -273,6 +273,62 @@ test('configured promptRules are emitted verbatim on every assembly', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+// ---------------------------------------------------------------------------
+// §9.1 strength tiers: zero friction when there is no conflict
+// (review task-8/9: "如果为了避免撞车反而让使用者受限 这也是完全不能接受的")
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive the registered `tools/pre-execute` gate the way the runtime would.
+ *
+ * `next` stands for the rest of the pipeline: it records that it was reached and
+ * returns the decision that pipeline chose (allow by default).
+ *
+ * @param {Map<string, Function>} hooks listeners registered through ctx.on().
+ * @param {Record<string, any>} exec the tool execution being authorized.
+ * @param {{ kind: string, [key: string]: any }} [decision] what the rest of the pipeline decides.
+ * @returns {Promise<{ result: any, nextCalls: number }>} the decision and whether next() ran.
+ */
+async function runGate(hooks, exec, decision = { kind: 'allow' }) {
+  const handler = hooks.get('tools/pre-execute')
+  assert.ok(handler, 'a tools/pre-execute listener must be registered')
+  let nextCalls = 0
+  const result = await handler(exec, async () => {
+    nextCalls += 1
+    return decision
+  })
+  return { result, nextCalls }
+}
+
+/** @param {string} root lock root. @returns {string[]} lock file names. */
+function lockFiles(root) {
+  try {
+    return fs.readdirSync(root).filter((name) => name.endsWith('.lock'))
+  } catch {
+    return []
+  }
+}
+
+/** @param {string} root lock root. @param {string} facetName sanitized facet. @returns {Record<string, any> | null} body. */
+function readLock(root, facetName) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(root, `${facetName}.lock`), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** Config for the "desktop automation" case the user reported. */
+function autoConfig(root, extra = {}) {
+  return {
+    lockRoot: root,
+    defaultTtlMs: 5000,
+    protectedTools: {
+      click: { key: 'screen:focus', autoAcquire: true, ttlMs: 15000, ...extra },
+    },
+  }
+}
+
 test('with no promptRules the rules provider emits nothing at all', () => {
   const root = tmpRoot()
   const { ctx, contexts } = makeCtx()
@@ -281,6 +337,307 @@ test('with no promptRules the rules provider emits nothing at all', () => {
   const rules = contexts.find((c) => c.name === 'resource-lease-rules')
   assert.ok(rules, 'the provider is registered even when unused')
   assert.equal(rules.text({}), '', 'an ordinary profile must pay zero prompt tokens')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('an unusable protectedTools entry is reported, not silently turned into a hole', async () => {
+  const root = tmpRoot()
+  const warnings = []
+  const { ctx, guards, hooks } = makeCtx()
+  // Capture the logger: a protection rule that cannot be parsed must be visible.
+  // (The host passes a logger FACTORY, which is what makeLogger() calls.)
+  ctx.logger = () => ({
+    info() {},
+    debug() {},
+    error() {},
+    warn: (message) => warnings.push(String(message)),
+  })
+  apply(ctx, {
+    lockRoot: root,
+    defaultTtlMs: 5000,
+    protectedTools: {
+      // No key at all -> cannot protect anything -> ignored, with a warning.
+      broken: { autoAcquire: true, ttlMs: 15000 },
+      blanks: { key: '   ' },
+      // Unknown fields are ignored on purpose (lenient like `resources`), and the
+      // documented fields still apply.
+      click: { key: 'screen:focus', autoAcquire: true, ttlMs: 15000, holdThrough: true, mystery: 42 },
+    },
+  })
+
+  // Only the config warnings matter here; the fake ctx also logs unrelated
+  // registration notices (it has no `ctx.get`), so filter by the prefix under test.
+  const configWarnings = warnings.filter((message) => /protectedTools\[/.test(message))
+  assert.equal(configWarnings.length, 2, `both unusable entries must be reported: ${JSON.stringify(configWarnings)}`)
+  assert.match(configWarnings.join('\n'), /"broken"/)
+  assert.match(configWarnings.join('\n'), /"blanks"/)
+
+  // The broken entries protect nothing: those tools are not gated at all.
+  assert.equal(guards[0]({ name: 'broken', agent: { session: { id: 's1' } } }), undefined)
+  assert.equal(guards[0]({ name: 'blanks', agent: { session: { id: 's1' } } }), undefined)
+  // The usable entry works exactly as configured, unknown field and all.
+  const ok = await runGate(hooks, { name: 'click', agent: { session: { id: 's1' } } })
+  assert.equal(ok.result.kind, 'allow')
+  assert.equal(lockFiles(root).length, 1)
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[9.1 auto] a FREE resource is acquired for the caller, so the tool runs', async () => {
+  const root = tmpRoot()
+  const { ctx, guards, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+  const exec = { name: 'click', agent: { session: { id: 'session-solo' } } }
+
+  // THE core assertion of this task: nobody holds screen:focus, one agent calls a
+  // protected tool, and it goes through -- instead of being refused for not having
+  // paid a manual resource_acquire first.
+  const { result, nextCalls } = await runGate(hooks, exec)
+  assert.equal(result.kind, 'allow', `a free protected resource must allow the call, got ${JSON.stringify(result)}`)
+  assert.equal(nextCalls, 1, 'the rest of the pipeline must be reached')
+
+  // ...and the lease really exists, so the action is VISIBLE to other agents
+  // (resource_status, prompt context) instead of being an invisible free pass.
+  const locks = lockFiles(root)
+  assert.deepEqual(locks, ['screen_focus.lock'], `exactly one lease must be recorded, saw ${locks.join(',')}`)
+  const meta = readLock(root, 'screen_focus')
+  assert.equal(meta.owner, 'session-solo', 'the lease must belong to the calling agent')
+  assert.equal(meta.key, 'screen:focus')
+  assert.equal(meta.reason, 'auto: click', 'the recorded reason must say where the lease came from')
+  assert.equal(meta.mode, 'exclusive')
+  // Long-lived plugin process: pid-gated by default (no pidGated:false), so a DSH
+  // restart reclaims this lease immediately instead of waiting out the TTL.
+  assert.equal(meta.ownerInfo.pidGated, undefined, 'an auto lease must stay pid-gated (no ghost after a restart)')
+
+  // The L-strict guard, untouched, now agrees because a lease exists.
+  assert.equal(guards[0](exec), undefined, 'the guard must pass once the lease exists')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[9.1 auto] consecutive calls REUSE the lease: never blocked by itself, never stacked', async () => {
+  const root = tmpRoot()
+  const { ctx, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+  const exec = { name: 'click', agent: { session: { id: 'session-repeat' } } }
+
+  const first = await runGate(hooks, exec)
+  assert.equal(first.result.kind, 'allow')
+  const afterFirst = readLock(root, 'screen_focus')
+  assert.ok(afterFirst)
+
+  // Second call inside the TTL: the previous lease is still live AND still ours.
+  // A naive "is anyone holding it?" test would refuse this -- the self-blocking bug.
+  const second = await runGate(hooks, exec)
+  assert.equal(second.result.kind, 'allow', `the second call must not be blocked by our own lease: ${JSON.stringify(second.result)}`)
+  assert.equal(second.nextCalls, 1)
+
+  const locks = lockFiles(root)
+  assert.equal(locks.length, 1, `reuse must not stack leases, saw ${locks.join(',')}`)
+  const afterSecond = readLock(root, 'screen_focus')
+  assert.equal(afterSecond.id, afterFirst.id, 'the SAME lease must be reused, not replaced')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[9.1 auto] another agent holding the resource is a REAL collision: deny with holder and time', async () => {
+  const root = tmpRoot()
+  const { ctx, tools, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+
+  await run(tools, 'resource_acquire', { key: 'screen:focus', reason: 'rendering charts' }, {
+    agent: { session: { id: 'session-holder' } },
+  })
+
+  const { result, nextCalls } = await runGate(hooks, { name: 'click', agent: { session: { id: 'session-late' } } })
+  assert.equal(result.kind, 'deny', 'a held resource must still be refused: that is the whole point of the lease')
+  assert.equal(nextCalls, 0, 'a denied call must never reach the tool')
+  assert.match(result.reason, /screen:focus/)
+  assert.match(result.reason, /session-holder/, 'the reason must name the holder')
+  assert.match(result.reason, /rendering charts/, 'the reason must quote what they are doing')
+  assert.match(result.reason, /\d+s left/, 'the reason must carry the remaining time')
+  // The other agent's lease is untouched.
+  assert.equal(readLock(root, 'screen_focus').owner, 'session-holder')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[9.1 auto] an acquire FAILURE denies the call (fail-closed), it never allows it', async () => {
+  // The one thing this task must not get wrong (review §10, Lead's rule): the old
+  // guard's `catch { return undefined }` turns a crash into a silent allow. With a
+  // lease on the line that would mean "tool ran, no lease, no trace".
+  const blocker = path.join(os.tmpdir(), `lease-not-a-dir-${process.pid}-${Math.random().toString(36).slice(2)}`)
+  fs.writeFileSync(blocker, 'a file where a lock root should be')
+  const { ctx, hooks } = makeCtx()
+  apply(ctx, autoConfig(blocker))
+
+  const { result, nextCalls } = await runGate(hooks, { name: 'click', agent: { session: { id: 'session-broken' } } })
+  assert.equal(result.kind, 'deny', `an unreachable lock root must DENY, got ${JSON.stringify(result)}`)
+  assert.equal(nextCalls, 0, 'fail-closed means the tool must NOT run')
+  assert.match(result.reason, /refused/i)
+  assert.match(result.reason, /screen:focus/)
+
+  fs.rmSync(blocker, { force: true })
+})
+
+test('[9.1 observe] the degraded tier refuses only a real collision and records nothing', async () => {
+  const root = tmpRoot()
+  const { ctx, tools, guards, hooks } = makeCtx()
+  apply(ctx, {
+    lockRoot: root,
+    defaultTtlMs: 5000,
+    protectedTools: { type_text: { key: 'screen:focus', mode: 'observe' } },
+  })
+  const exec = { name: 'type_text', agent: { session: { id: 'session-observer' } } }
+
+  const free = await runGate(hooks, exec)
+  assert.equal(free.result.kind, 'allow')
+  assert.equal(free.nextCalls, 1)
+  assert.deepEqual(lockFiles(root), [], 'observe must NOT take a lease')
+  assert.equal(guards[0](exec), undefined, 'the guard must allow observe-tier tools that hold nothing')
+
+  // Someone else takes it: the same call is now refused, with the holder named.
+  await run(tools, 'resource_acquire', { key: 'screen:focus', reason: 'taking the mouse' }, {
+    agent: { session: { id: 'session-holder' } },
+  })
+  const blocked = guards[0](exec)
+  assert.equal(typeof blocked, 'string', 'a conflicting holder must be refused in observe mode')
+  assert.match(blocked, /session-holder/)
+  assert.match(blocked, /\d+s left/)
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[v1 regression] the string form keeps L-STRICT semantics: no lease is taken for the caller', async () => {
+  const root = tmpRoot()
+  const { ctx, guards, hooks } = makeCtx()
+  apply(ctx, { lockRoot: root, defaultTtlMs: 5000, protectedTools: { type_text: 'screen:focus' } })
+  const exec = { name: 'type_text', agent: { session: { id: 'session-v1' } } }
+
+  // The new hook must not quietly start acquiring leases for v1 config.
+  const { result, nextCalls } = await runGate(hooks, exec)
+  assert.equal(result.kind, 'allow', 'the hook itself does not decide for v1 config')
+  assert.equal(nextCalls, 1)
+  assert.deepEqual(lockFiles(root), [], 'a v1 string entry must not create a lease on its own')
+
+  // ...and the guard still refuses, byte-for-byte as before.
+  const denied = guards[0](exec)
+  assert.equal(typeof denied, 'string', 'v1 L-strict must still deny an unheld protected tool')
+  assert.match(denied, /screen:focus/)
+  assert.match(denied, /requires the resource "screen:focus", which you do not hold\./)
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a tool that is not in protectedTools always passes, with zero side effects', async () => {
+  const root = tmpRoot()
+  const { ctx, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+  const { result, nextCalls } = await runGate(hooks, { name: 'read_file', agent: { session: { id: 's-any' } } })
+  assert.equal(result.kind, 'allow')
+  assert.equal(nextCalls, 1)
+  assert.deepEqual(lockFiles(root), [])
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('an EXPIRED foreign lease does not turn into a permanent denial', async () => {
+  const root = tmpRoot()
+  fs.mkdirSync(root, { recursive: true })
+  // A lease from a process that died: expired, still on disk.
+  fs.writeFileSync(path.join(root, 'screen_focus.lock'), JSON.stringify({
+    id: 'lz_expired00001',
+    key: 'screen:focus',
+    facet: 'screen:focus',
+    facets: ['screen:focus'],
+    mode: 'exclusive',
+    owner: 'session-dead',
+    reason: 'crashed mid-click',
+    pid: 999999,
+    host: os.hostname(),
+    createdAt: Date.now() - 60000,
+    expiresAt: Date.now() - 30000,
+  }))
+  const { ctx, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+
+  const { result } = await runGate(hooks, { name: 'click', agent: { session: { id: 'session-next' } } })
+  assert.equal(result.kind, 'allow', 'an expired lease is takeable, so it must not refuse the call for ever')
+  const meta = readLock(root, 'screen_focus')
+  assert.equal(meta.owner, 'session-next', 'the expired lease must be replaced by ours')
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('an auto lease is RELEASED when the call does not run (deny, throw, or cancel)', async () => {
+  const root = tmpRoot()
+
+  // (a) the rest of the pipeline denies -> our lease must not survive
+  {
+    const { ctx, hooks } = makeCtx()
+    apply(ctx, autoConfig(root))
+    const { result } = await runGate(hooks, { name: 'click', agent: { session: { id: 's-a' } } }, { kind: 'deny', reason: 'policy' })
+    assert.equal(result.kind, 'deny')
+    assert.deepEqual(lockFiles(root), [], 'a denied call must not leave a lease behind')
+  }
+
+  // (b) the rest of the pipeline throws -> deny, and no ghost lease
+  {
+    const { ctx, hooks } = makeCtx()
+    apply(ctx, autoConfig(root))
+    const handler = hooks.get('tools/pre-execute')
+    const result = await handler({ name: 'click', agent: { session: { id: 's-b' } } }, async () => {
+      throw new Error('downstream gate exploded')
+    })
+    assert.equal(result.kind, 'deny', 'an exception must fail CLOSED and deny the call')
+    assert.match(result.reason, /failed closed|refused/i)
+    assert.deepEqual(lockFiles(root), [], 'a crashed pipeline must not leave a ghost lease')
+  }
+
+  // (c) an already-aborted call is cancelled before anything is acquired
+  {
+    const { ctx, hooks } = makeCtx()
+    apply(ctx, autoConfig(root))
+    const controller = new AbortController()
+    controller.abort()
+    const { result, nextCalls } = await runGate(hooks, { name: 'click', agent: { session: { id: 's-c' } }, signal: controller.signal })
+    assert.equal(result.kind, 'cancel')
+    assert.equal(nextCalls, 0)
+    assert.deepEqual(lockFiles(root), [], 'a cancelled call must not acquire anything')
+  }
+
+  // (d) `ask` KEEPS the lease on purpose. The hook cannot see how approval turns
+  // out; releasing before the answer would make the L-strict guard refuse an
+  // APPROVED call. The residue is bounded by ttlMs and is reused by the next call.
+  {
+    const { ctx, guards, hooks } = makeCtx()
+    apply(ctx, autoConfig(root))
+    const exec = { name: 'click', agent: { session: { id: 's-d' } } }
+    const { result } = await runGate(hooks, exec, { kind: 'ask', reason: 'needs approval' })
+    assert.equal(result.kind, 'ask', 'the ask decision must be passed through unchanged')
+    assert.equal(lockFiles(root).length, 1, 'ask keeps the lease so an approved call still passes the guard')
+    assert.equal(guards[0](exec), undefined, 'the guard must let the approved call through')
+  }
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[safety baseline] two agents both relying on auto-acquire: exactly one wins', async () => {
+  // This is the case that a naive "free means allow" design gets wrong: with both
+  // agents undeclared, one must win the lease and the other must be refused.
+  const root = tmpRoot()
+  const { ctx, hooks } = makeCtx()
+  apply(ctx, autoConfig(root))
+
+  const a = await runGate(hooks, { name: 'click', agent: { session: { id: 'session-A' } } })
+  const b = await runGate(hooks, { name: 'click', agent: { session: { id: 'session-B' } } })
+
+  assert.equal(a.result.kind, 'allow')
+  assert.equal(b.result.kind, 'deny', 'the second agent must NOT also be allowed in')
+  assert.match(b.result.reason, /session-A/)
+  assert.equal(lockFiles(root).length, 1, 'exactly one lease may exist')
+  assert.equal(readLock(root, 'screen_focus').owner, 'session-A')
 
   fs.rmSync(root, { recursive: true, force: true })
 })

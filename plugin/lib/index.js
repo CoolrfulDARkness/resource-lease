@@ -158,15 +158,73 @@ function defineTool(options) {
 }
 
 /**
+ * Normalise ONE `protectedTools` entry (§9.1 strength tiers).
+ *
+ * Two shapes are accepted, and the difference is a SAFETY decision, not a syntax
+ * preference:
+ *
+ *   - **string** (`tool: 'screen:focus'`) is v1's L-strict form and keeps its
+ *     semantics byte-for-byte: the caller must hold the lease, or the guard
+ *     refuses. Nothing is acquired on its behalf.
+ *   - **object** (`{ key, autoAcquire, ttlMs, reason, mode }`) is the opt-in for
+ *     the new tiers. `autoAcquire: true` means "take a short lease for me if the
+ *     resource is free"; `mode: 'observe'` means "never take a lease, only refuse
+ *     when someone else holds it".
+ *
+ * Unknown fields are ignored (the same lenient style as `resources`), but a
+ * missing/unusable `key` is reported: silently dropping a protection rule is
+ * exactly the kind of quiet hole this plugin exists to prevent.
+ *
+ * @param {string} tool tool name as registered with the runtime.
+ * @param {unknown} value the raw config value for that tool.
+ * @param {number} defaultTtlMs fallback TTL for an auto-acquired lease.
+ * @param {(message: string) => void} warn logger for unusable entries.
+ * @returns {{ key: string, mode: 'strict' | 'observe', autoAcquire: boolean, ttlMs: number, reason: string } | null} spec, or null when unusable.
+ */
+function normalizeProtectedTool(tool, value, defaultTtlMs, warn) {
+  if (typeof value === 'string') {
+    const key = value.trim()
+    if (key === '') {
+      warn(`protectedTools["${tool}"] is an empty key; the entry is ignored`)
+      return null
+    }
+    // v1: L-strict, no automatic acquisition. The guard is the only judge.
+    return { key, mode: 'strict', autoAcquire: false, ttlMs: defaultTtlMs, reason: `auto: ${tool}` }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    warn(`protectedTools["${tool}"] must be a key string or an object with a "key"; the entry is ignored`)
+    return null
+  }
+  const key = typeof value.key === 'string' ? value.key.trim() : ''
+  if (key === '') {
+    warn(`protectedTools["${tool}"] has no usable "key"; the entry is ignored`)
+    return null
+  }
+  // 'observe' is the explicit degraded tier. Anything else stays strict, so a
+  // typo in `mode` can never silently LOWER the protection level.
+  const mode = value.mode === 'observe' ? 'observe' : 'strict'
+  // Auto-acquisition is opt-in: only a literal `true` turns it on. A missing or
+  // misspelled flag must leave the v1 behaviour in place.
+  const autoAcquire = value.autoAcquire === true
+  const ttlRaw = Number(value.ttlMs)
+  const ttlMs = Number.isFinite(ttlRaw) && ttlRaw >= 1000 ? Math.trunc(ttlRaw) : defaultTtlMs
+  const reason = typeof value.reason === 'string' && value.reason.trim() !== ''
+    ? value.reason.trim()
+    : `auto: ${tool}`
+  return { key, mode, autoAcquire, ttlMs, reason }
+}
+
+/**
  * Merge the row config with built-in defaults.
  *
  * Written independently of the Config schema on purpose: the schema is the
  * user-facing contract, this is what the code actually runs on.
  *
  * @param {unknown} raw the Loader row's config.
- * @returns {{ enabled: boolean, lockRoot: string, defaultTtlMs: number, maxWaitMs: number, onTimeout: string, resources: Record<string, { mode: string, slots: number }>, protectedTools: Record<string, string> }} resolved config.
+ * @param {(message: string) => void} [warn] logger for ignored entries.
+ * @returns {{ enabled: boolean, lockRoot: string, defaultTtlMs: number, maxWaitMs: number, onTimeout: string, resources: Record<string, { mode: string, slots: number }>, protectedTools: Record<string, { key: string, mode: 'strict' | 'observe', autoAcquire: boolean, ttlMs: number, reason: string }>, aliases: Record<string, string>, promptRules: string[] }} resolved config.
  */
-function normalizeConfig(raw) {
+function normalizeConfig(raw, warn = () => {}) {
   const c = raw && typeof raw === 'object' ? raw : {}
 
   const resources = {}
@@ -179,11 +237,11 @@ function normalizeConfig(raw) {
     }
   }
 
-  const protectedTools = {}
+  // Resolved per-tool specs; the TTL default is only known after defaultTtlMs, so
+  // this runs again at the bottom of this function.
+  const protectedToolsRaw = {}
   if (c.protectedTools && typeof c.protectedTools === 'object' && !Array.isArray(c.protectedTools)) {
-    for (const [tool, key] of Object.entries(c.protectedTools)) {
-      if (typeof key === 'string' && key.trim() !== '') protectedTools[tool] = key.trim()
-    }
+    for (const [tool, value] of Object.entries(c.protectedTools)) protectedToolsRaw[tool] = value
   }
 
   // §3.3.1: browser:profile:<name> can only expand to a directory facet when
@@ -224,6 +282,12 @@ function normalizeConfig(raw) {
       : 30000
 
   const maxWaitMs = Number.isFinite(c.maxWaitMs) && c.maxWaitMs >= 0 ? Math.trunc(c.maxWaitMs) : 120000
+
+  const protectedTools = {}
+  for (const [tool, value] of Object.entries(protectedToolsRaw)) {
+    const spec = normalizeProtectedTool(tool, value, defaultTtlMs, warn)
+    if (spec !== null) protectedTools[tool] = spec
+  }
 
   return {
     enabled: c.enabled !== false,
@@ -325,10 +389,12 @@ function textRender(fn) {
  * @param {unknown} config the Loader row's config.
  */
 export function apply(ctx, config) {
-  const cfg = normalizeConfig(config)
+  // The logger comes first so config problems (an unusable protectedTools entry)
+  // are reported through the host's logger instead of vanishing.
+  const log = makeLogger(ctx)
+  const cfg = normalizeConfig(config, (message) => log.warn(message))
   if (!cfg.enabled) return
 
-  const log = makeLogger(ctx)
   /** Leases this process holds: lease id -> metadata. */
   const held = new Map()
   /** Disposers registered on agent contexts, so plugin unload removes them. */
@@ -418,6 +484,106 @@ export function apply(ctx, config) {
       }
       return false
     })
+  }
+
+  /**
+   * Every LIVE, OTHER OWNER's lease that conflicts with `key`.
+   *
+   * This is the "someone else is in the way" half of §9.1, and it is the whole
+   * decision for `mode: 'observe'`: refuse only when another agent actually holds
+   * a conflicting facet.
+   *
+   * Deliberate exclusions, all three of which prevent a permanent false denial:
+   *   - our OWN leases never count (that is the self-blocking trap: a short-TTL
+   *     auto lease we took on the previous call must not refuse the next one);
+   *   - expired leases do not count (TTL ran out: takeable, not held);
+   *   - leases whose owner is provably dead do not count (G3: the next acquire
+   *     would collect them, so refusing would be a lie).
+   *
+   * @param {string} owner this caller's agent key.
+   * @param {string} key resource key wanted.
+   * @param {string} [wantMode] mode the caller would use; 'exclusive' by default.
+   * @returns {Array<{ id: string | null, facet: string, agent: string, reason: string, expiresInMs: number | null, mode: string }>} one row per blocking lease.
+   */
+  function otherHolders(owner, key, wantMode = 'exclusive') {
+    const now = Date.now()
+    const wanted = lock.facetsOf(key)
+    const rows = []
+    /** @type {Set<string>} one row per lease, not one per conflicting facet pair */
+    const seen = new Set()
+    for (const meta of lock.listLocks(cfg.lockRoot)) {
+      if (!meta || typeof meta !== 'object') continue
+      if (lock.isExpired(meta, now)) continue
+      const info = lock.ownerInfoOf(meta)
+      if (info.agent !== undefined && info.agent === owner) continue // never our own
+      if (lock.isOwnerAlive(meta, { now }) === false) continue // provably gone (G3)
+      const theirFacets = lock.facetsOfMeta(meta)
+      if (theirFacets.length === 0) continue
+      const theirMode = typeof meta.mode === 'string' ? meta.mode : 'exclusive'
+      for (const facet of wanted) {
+        for (const theirFacet of theirFacets) {
+          if (!lock.facetsClash(facet, wantMode, theirFacet, theirMode)
+            && !lock.facetsClash(theirFacet, theirMode, facet, wantMode)) continue
+          const id = typeof meta.id === 'string' ? meta.id : null
+          const tag = id ?? `${theirFacet}|${info.agent ?? ''}`
+          if (seen.has(tag)) continue
+          seen.add(tag)
+          const expiresAt = Number(meta.expiresAt)
+          rows.push({
+            id,
+            facet: theirFacet,
+            agent: info.agent ?? '(unknown)',
+            reason: typeof meta.reason === 'string' ? meta.reason : '',
+            expiresInMs: Number.isFinite(expiresAt) ? Math.max(0, Math.trunc(expiresAt - now)) : null,
+            mode: theirMode,
+          })
+        }
+      }
+    }
+    return rows
+  }
+
+  /**
+   * A refusal reason a human (or a model) can act on: WHO holds it, for HOW LONG,
+   * WHY, and what to do instead. Kept in one place so the observe tier and the
+   * auto-acquire tier tell the same story.
+   *
+   * @param {string} key the resource wanted.
+   * @param {ReadonlyArray<Record<string, any>>} rows blocking rows.
+   * @returns {string} deny reason.
+   */
+  function busyReason(key, rows) {
+    const list = Array.isArray(rows) ? rows : []
+    if (list.length === 0) {
+      return `"${key}" is held by another agent right now, so this call was refused. `
+        + 'Wait for it to be released (resource_status shows the holder), then retry.'
+    }
+    const described = list.slice(0, 3).map((row) => {
+      const heldBy = row.heldBy && typeof row.heldBy === 'object' ? row.heldBy : null
+      const agent = row.agent ?? heldBy?.agent ?? '(unknown)'
+      const rawLeft = row.expiresInMs ?? row.expiresIn
+      const left = Number.isFinite(Number(rawLeft))
+        ? `${Math.max(0, Math.ceil(Number(rawLeft) / 1000))}s left`
+        : 'expiry unknown'
+      const why = typeof row.reason === 'string' && row.reason !== '' ? `, reason: ${row.reason}` : ''
+      const facet = typeof row.facet === 'string' && row.facet !== '' ? `${row.facet} ` : ''
+      return `${facet}held by ${agent} (${left}${why})`
+    })
+    return `"${key}" is busy: ${described.join('; ')}. `
+      + 'This call was refused instead of running without the resource. '
+      + 'Wait for the holder to finish (resource_status shows the remaining time) and retry.'
+  }
+
+  /**
+   * Whether the tool call was already cancelled. §9's pre-execute contract
+   * requires an async gate to observe `exec.signal`.
+   *
+   * @param {unknown} exec tool execution.
+   * @returns {boolean} true when the signal is aborted.
+   */
+  function isAborted(exec) {
+    const signal = exec && typeof exec === 'object' ? /** @type {any} */ (exec).signal : undefined
+    return Boolean(signal && signal.aborted === true)
   }
 
   /**
@@ -1042,21 +1208,158 @@ export function apply(ctx, config) {
 
   // ------------------------------------------------------------ 4. guard
 
+  // The guard is a SYNCHRONOUS, judgement-only gate ("monotonic denial" in the
+  // Service's own words): it may add a refusal, and it may not do work with side
+  // effects. Automatic acquisition therefore does NOT live here -- it lives in the
+  // `tools/pre-execute` listener below, which is async, runs BEFORE this guard, and
+  // has an explicit deny result. By the time the guard runs, either a lease exists
+  // (this listener acquired it) and `holds()` is true, or the request was already
+  // denied. Two gates, and the second one is a pure fallback that cannot fail open
+  // into "tool ran without a lease".
+  //
+  // The `catch { return undefined }` below stays fail-OPEN on purpose, and it is
+  // only safe because nothing in here has a side effect: a judgement that crashes
+  // leaves the world exactly as it found it, so refusing a whole tool pipeline over
+  // a broken status read would be worse. That argument does NOT extend to the
+  // pre-execute listener -- see the deny-on-exception rule there.
   ctx.effect(() => ctx.tools.guard((exec) => {
     try {
-      const needed = cfg.protectedTools[/** @type {any} */ (exec)?.name]
-      if (needed === undefined) return undefined
+      const spec = cfg.protectedTools[/** @type {any} */ (exec)?.name]
+      if (spec === undefined) return undefined
       const owner = agentKey(/** @type {any} */ (exec)?.agent) ?? processOwner()
-      if (holds(owner, needed)) return undefined
-      return `Tool "${/** @type {any} */ (exec).name}" requires the resource "${needed}", which you do not hold. `
-        + `Call resource_acquire with key="${needed}" and a reason describing what you are about to do, then retry "${/** @type {any} */ (exec).name}". `
-        + `If "${needed}" is busy, resource_status shows the current holder and the remaining time.`
+      if (spec.mode === 'observe') {
+        // Declared-observe tier: holding nothing is legal, so the only refusal is a
+        // real collision with another live holder. Pure read, no side effect.
+        const others = otherHolders(owner, spec.key, 'exclusive')
+        if (others.length === 0) return undefined
+        return `Tool "${/** @type {any} */ (exec).name}" is blocked: ${busyReason(spec.key, others)}`
+      }
+      if (holds(owner, spec.key)) return undefined
+      // v1 wording, unchanged: an operator grep for it must still find it.
+      return `Tool "${/** @type {any} */ (exec).name}" requires the resource "${spec.key}", which you do not hold. `
+        + `Call resource_acquire with key="${spec.key}" and a reason describing what you are about to do, then retry "${/** @type {any} */ (exec).name}". `
+        + `If "${spec.key}" is busy, resource_status shows the current holder and the remaining time.`
     } catch {
       // A guard that throws would deny or break the tool pipeline; an unknown
       // state is treated as "not protected" rather than blocking the agent.
       return undefined
     }
   }), 'dsh-resource-lease: protected tools guard')
+
+  // ------------------------------------------- 4b. zero-friction auto-acquire
+  //
+  // "If avoiding a collision means the user cannot work, that is not acceptable."
+  // (§9.1 strength tiers, `autoAcquire`): for a tool explicitly configured with
+  // `autoAcquire: true`, take a SHORT lease when the resource is free instead of
+  // making the caller pay a manual `resource_acquire` tax first.
+  //
+  // Why here and not in the guard: this hook is async (acquisition is disk I/O),
+  // it runs before the guard, and it can DENY. That last property is the whole
+  // point -- see the exception rule below.
+  //
+  // Failure directions, which are the reason this is not written inside the guard's
+  // `try` block:
+  //   - resource free  -> acquire, then allow        (zero friction, lease visible)
+  //   - someone holds  -> deny with holder + TTL     (real collision: refuse)
+  //   - acquire throws -> DENY                        (fail-CLOSED; never allow)
+  //   - next() throws  -> DENY, and release our lease (fail-closed, no ghost)
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    /** Id of a lease this call created, so every failure path can release it. */
+    let createdId = null
+    try {
+      if (!cfg.enabled) return await next()
+      const spec = cfg.protectedTools[/** @type {any} */ (exec)?.name]
+      // Not protected -> zero cost, straight through.
+      if (spec === undefined) return await next()
+      // v1 string config, and `autoAcquire: false`: the guard's L-strict semantics
+      // decide, exactly as before this hook existed.
+      if (spec.mode === 'observe' || spec.autoAcquire !== true) return await next()
+
+      const owner = agentKey(/** @type {any} */ (exec)?.agent) ?? processOwner()
+
+      // Already ours -> reuse, do NOT acquire again. This is the self-blocking
+      // trap: an auto lease from the previous call is still live and belongs to
+      // us, so a naive "is anyone holding it?" test would refuse our own lease.
+      if (holds(owner, spec.key)) return await next()
+
+      // A call cancelled before we start must not leave a lease behind.
+      if (isAborted(exec)) return { kind: 'cancel' }
+
+      try {
+        createdId = (await lease({
+          key: spec.key,
+          mode: 'exclusive',
+          ttlMs: spec.ttlMs,
+          reason: spec.reason,
+          owner,
+        })).id
+      } catch (error) {
+        // CONCURRENCY: two calls from the SAME agent can race here (both saw "not
+        // held"). The loser's conflict is with the winner's lease, which is ours,
+        // so re-check before refusing -- otherwise a single agent would refuse
+        // itself.
+        if (holds(owner, spec.key)) return await next()
+        if (error && typeof error === 'object' && /** @type {any} */ (error).code === 'RESOURCE_BUSY') {
+          const conflicts = /** @type {any} */ (error).conflicts
+          return { kind: 'deny', reason: busyReason(spec.key, conflicts) }
+        }
+        // Anything else (unwritable lock root, disk full, a bug) must NOT run the
+        // tool: an unrecorded action is the silent double-hold this plugin exists
+        // to prevent. Fail CLOSED and say why.
+        const why = error instanceof Error ? error.message : String(error)
+        return {
+          kind: 'deny',
+          reason: `Cannot record a lease for "${spec.key}", so the call was refused: ${why}. `
+            + 'Fix the lock root (or the lease backend) and retry.',
+        }
+      }
+
+      // The gate let us through; the decision below belongs to the rest of the
+      // pipeline. If it stops the tool, the lease we just took must go with it.
+      const decision = await next()
+
+      // Cancellation wins over everything: the tool will not run, so holding a
+      // lease for it would be exactly the ghost we are trying to avoid.
+      if (isAborted(exec)) {
+        releaseOne(createdId)
+        createdId = null
+        return { kind: 'cancel' }
+      }
+
+      // deny/cancel mean the tool will NOT run, so release at once. `ask` is
+      // deliberately NOT in this list: approval may still let the tool run, and
+      // this hook never sees the approval outcome. Releasing here would then let
+      // the L-strict guard refuse an APPROVED call. Keeping the lease is the safe
+      // side of that ambiguity, and its cost is bounded: the lease is ours, the
+      // next call reuses it, and the TTL (<= ttlMs) bounds the residue if the
+      // approval is refused.
+      const stops = decision && typeof decision === 'object'
+        && (decision.kind === 'deny' || decision.kind === 'cancel')
+      if (stops) {
+        releaseOne(createdId)
+        createdId = null
+      }
+      return decision
+    } catch (error) {
+      // Absolute rule for a gate that takes a lease: an exception must DENY.
+      // Returning `next()`/allow here would be the fail-open channel the design
+      // calls out -- the tool runs, no lease was ever recorded, and nobody can see
+      // afterwards that a collision happened.
+      if (createdId !== null) {
+        try {
+          releaseOne(createdId)
+        } catch {
+          /* the TTL still bounds the residue; never mask the original failure */
+        }
+      }
+      const why = error instanceof Error ? error.message : String(error)
+      return {
+        kind: 'deny',
+        reason: `The resource-lease gate failed closed, so this call was refused: ${why}. `
+          + 'Retry; if it keeps failing, check resource_status and the plugin log.',
+      }
+    }
+  })
 
   // ------------------------------------------------- 5. per-agent cleanup
 
