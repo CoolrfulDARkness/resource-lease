@@ -204,13 +204,13 @@ orderKey(facet) := canonicalClass || ":" || canonicalSubject
   "slots": 1,
   "slot": 0,
   "owner": {
-    "agent": "atk-3",
+    "agent": "agent-a",
     "session": "01J8ZK...",
     "pid": 12345,
     "host": "WORKSTATION",
     "procStart": 1763200000000
   },
-  "reason": "跑榜单截图",
+  "reason": "跑报表导出",
   "createdAt": 1763200000000,
   "expiresAt": 1763200060000,
   "lockPath": "C:\\Users\\me\\AppData\\Local\\dsh-resource-lease\\locks\\browser_profile_work.lock"
@@ -286,8 +286,8 @@ release(leaseId) → 读索引 → 逐个 removeIfOwned → 删索引
   "conflicts": [
     {
       "facet": "path:d:/out",
-      "heldBy": { "agent": "atk-3", "session": "...", "pid": 1234, "host": "PC-01" },
-      "reason": "跑榜单截图",
+      "heldBy": { "agent": "agent-a", "session": "...", "pid": 1234, "host": "PC-01" },
+      "reason": "跑报表导出",
       "expiresInMs": 12000,
       "mode": "exclusive"
     }
@@ -309,7 +309,7 @@ release(leaseId) → 读索引 → 逐个 removeIfOwned → 删索引
 `resource_acquire` 冲突时抛错,错误文本必须让模型能自己决策,形如:
 
 ```
-Resource busy: path:d:/out - held by atk-3 (exclusive, 41s left, reason: 跑榜单截图).
+Resource busy: path:d:/out - held by agent-a (exclusive, 41s left, reason: 跑报表导出).
 Wait for the holder to release it (or let its TTL expire), then acquire again.
 ```
 
@@ -391,8 +391,8 @@ Wait for the holder to release it (or let its TTL expire), then acquire again.
 ```
 BLOCKED on path:D:/out
 冲突 facet: path:d:/out
-持有者: atk-3   pid=14568   host=PC-01   reason=跑榜单截图   剩余 12s
-我的任务: def-208 生成社交卡片
+持有者: agent-a   pid=14568   host=PC-01   reason=跑报表导出   剩余 12s
+我的任务: agent-b 生成社交卡片
 建议: 等 12s 后重试,或把本任务改成串行执行
 ```
 

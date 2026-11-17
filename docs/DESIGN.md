@@ -231,7 +231,7 @@ v2 的 owner 必填 `{ agent, session, pid, host, procStart }`,回收规则:
 }
 ```
 
-**`reason` 必填** —— 这是「主控知道子 agent 在干嘛」的最小信息量。一条 `browser:profile:work held by atk-3 (跑榜单截图,剩余 12s)` 胜过长篇日志。
+**`reason` 必填** —— 这是「主控知道子 agent 在干嘛」的最小信息量。一条 `browser:profile:work held by agent-a (跑报表导出,剩余 12s)` 胜过长篇日志。
 
 v2 的模型变化只有两处:`facets` 是数组(v1 的 `key` 是单值,由 facets 派生),`owner` 多了 `procStart`。
 

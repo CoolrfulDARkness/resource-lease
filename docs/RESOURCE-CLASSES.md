@@ -64,9 +64,9 @@
 ```
 BLOCKED on browser:profile:work
 冲突 facet: path:c:/users/me/appdata/local/google/chrome/user data
-持有者: atk-3   pid=14568   host=PC-01   reason=填知乎长文   剩余 412s
-我的任务: def-208 生成社交卡片
-建议: 改用 browser:profile:scratch 另开一个 profile,或排到 atk-3 之后
+持有者: agent-a   pid=14568   host=PC-01   reason=填知乎长文   剩余 412s
+我的任务: agent-b 生成社交卡片
+建议: 改用 browser:profile:scratch 另开一个 profile,或排到 agent-a 之后
 ```
 
 注意冲突 facet 报的是 **path**,不是你写的 `browser:profile:work` —— 因为挡住你的是别人的 profile 目录锁。这正是 facet 模型的用处:你不会因为「名字不一样」而误判成没冲突。
@@ -92,7 +92,7 @@ BLOCKED on browser:profile:work
 ### 怎么选不冲突的端口(照做)
 
 1. 先看盘:`lease.ps1 status`(或 `resource_status`),把已被占的端口列出来。
-2. **给每个 agent 划一段**(例如 atk-3 → 4100–4199,def-208 → 4200–4299),写进任务模板。区间法是唯一在并发下不需要协调的办法。
+2. **给每个 agent 划一段**(例如 agent-a → 4100–4199,agent-b → 4200–4299),写进任务模板。区间法是唯一在并发下不需要协调的办法。
 3. 避开这些常用默认值:9222(Chrome 调试)、3000/5173/8080(各种脚手架)、5432/6379(数据库)。
 4. 把选定的端口**写进任务描述**,让同批任务的其它 agent 不用猜。
 
@@ -106,7 +106,7 @@ BLOCKED on browser:profile:work
 ```
 BLOCKED on port:3000
 冲突 facet: port:3000
-持有者: def-208   pid=9912   reason=next dev   剩余 1740s
+持有者: agent-b   pid=9912   reason=next dev   剩余 1740s
 建议: 换到你的号段(4100–4199),不要等 —— 长驻 server 的 TTL 是按小时算的
 ```
 
@@ -154,8 +154,8 @@ $LEASE = "./cli/lease.ps1"   # 后面几个场景都复用这个变量
 ```
 BLOCKED on path:d:/repo
 冲突 facet: path:d:/repo/node_modules
-持有者: atk-3   pid=14568   reason=npm install   剩余 733s
-我的任务: def-208 跑单元测试
+持有者: agent-a   pid=14568   reason=npm install   剩余 733s
+我的任务: agent-b 跑单元测试
 建议: 等装完再跑(测试会读 node_modules,并发一定读到半成品),或改到独立 worktree
 ```
 
@@ -267,7 +267,7 @@ BLOCKED on named:publish:@scope/pkg
 ```
 BLOCKED on path:d:/out
 冲突 facet: path:d:/out
-持有者: atk-3   pid=14568   reason=跑榜单截图(批量 240 张)   剩余 388s
+持有者: agent-a   pid=14568   reason=跑报表导出(批量 240 张)   剩余 388s
 建议: 你的输出目录是 D:/out/sub —— 它在这个祖先下面,必然被挡。改成 D:/out-def208 再来
 ```
 
@@ -304,8 +304,8 @@ BLOCKED on path:d:/out
 ```
 BLOCKED on api:openai:rpm
 冲突 facet: api:openai:rpm(pool 2/2 已满)
-持有者: atk-3(剩 41s)/ def-208(剩 18s)
-建议: --wait 20s 让 def-208 先释放,或把自己的并发降到 1 再来
+持有者: agent-a(剩 41s)/ agent-b(剩 18s)
+建议: --wait 20s 让 agent-b 先释放,或把自己的并发降到 1 再来
 ```
 
 名额类冲突**不是「变慢」而是「明确失败」**,这正是它比 429 好的地方:429 你还会重试,失败了三次才发现是配额;租约第一次就告诉你谁占着、还剩多久。

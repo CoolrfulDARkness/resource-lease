@@ -80,7 +80,7 @@
   .\\lease.ps1 acquire path:D:/out port:9222 --ttl 300s --reason "build"
   .\\lease.ps1 acquire browser:profile:work -Ttl 600s -Reason "screenshot"
   .\\lease.ps1 run --keys path:D:/out,port:9222 -- node build.mjs
-  .\\lease.ps1 release --id lz_ab12cd34ef56 | release --all --owner atk-3
+  .\\lease.ps1 release --id lz_ab12cd34ef56 | release --all --owner agent-a
   .\\lease.ps1 status
 
 .NOTES

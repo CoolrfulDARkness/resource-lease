@@ -299,8 +299,8 @@ acquire(requests[], ttlMs, reason, strategy):
 {
   "ok": false,
   "conflicts": [
-    { "facet": "path:d:/out", "heldBy": {"agent":"atk-3","session":"...","pid":1234,"host":"PC"},
-      "reason": "跑榜单截图", "expiresInMs": 12000, "mode": "exclusive" }
+    { "facet": "path:d:/out", "heldBy": {"agent":"agent-a","session":"...","pid":1234,"host":"PC"},
+      "reason": "跑报表导出", "expiresInMs": 12000, "mode": "exclusive" }
   ],
   "released": ["port:9222"]        // 已回滚的
 }
@@ -316,11 +316,11 @@ owner 记录的逻辑字段:`{ agent, session, pid, host, procStart }`
 
 ```jsonc
 // 插件写(形态 1):owner 是对象
-"owner": { "agent": "atk-3", "session": "s_...", "pid": 1234, "host": "PC", "procStart": 0, "pidGated": true }
+"owner": { "agent": "agent-a", "session": "s_...", "pid": 1234, "host": "PC", "procStart": 0, "pidGated": true }
 
 // CLI 写(形态 2):owner 是字符串,身份另放 ownerInfo
-"owner": "atk-3",
-"ownerInfo": { "agent": "atk-3", "session": "...", "pid": 1234, "host": "PC", "procStart": 0, "pidGated": false }
+"owner": "agent-a",
+"ownerInfo": { "agent": "agent-a", "session": "...", "pid": 1234, "host": "PC", "procStart": 0, "pidGated": false }
 ```
 
 - 读侧:先看 `owner` 是否为对象,是则直接取字段;否则取 `ownerInfo`,缺失时把字符串 `owner` 当作 `agent`。
@@ -378,7 +378,7 @@ resource_status({ key? , owner? })
 ```powershell
 .\lease.ps1 acquire path:D:/out port:9222 --ttl 300s --reason "构建"
 .\lease.ps1 acquire browser:profile:work --ttl 600s
-.\lease.ps1 release --id <leaseId> | --all --owner atk-3
+.\lease.ps1 release --id <leaseId> | --all --owner agent-a
 .\lease.ps1 status [--key <key>]
 .\lease.ps1 run --keys path:D:/out,port:9222 -- node build.mjs
 ```

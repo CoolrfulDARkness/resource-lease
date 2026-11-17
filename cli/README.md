@@ -27,7 +27,7 @@ $LEASE = "./cli/lease.ps1"
 成功时把租约 JSON 打到 stdout(含 `id`、`expiresAt`),退出码 0。
 
 ```powershell
-& $LEASE acquire browser:chromium -Ttl 5m -Wait 120s -Reason "榜单截图"
+& $LEASE acquire browser:chromium -Ttl 5m -Wait 120s -Reason "导出报表截图"
 ```
 
 - `-Ttl` 默认 30s(或 `$DSH_RESOURCE_TTL`)。**长任务务必给足**,否则跑到一半锁被别人接管。
@@ -44,8 +44,8 @@ $LEASE = "./cli/lease.ps1"
 ```
 key              mode        owner  reason       remain  pid
 ---              ----        -----  ------       ------  ---
-browser:chromium pool(1/2)   atk-3  榜单截图     42s     14568
-port:9222        exclusive   def-208 调试端口     8s     9912
+browser:chromium pool(1/2)   agent-a  导出报表截图     42s     14568
+port:9222        exclusive   agent-b 调试端口     8s     9912
 ```
 
 `remain` 显示 `EXPIRED(takeable)` 表示这条锁已过期、下一个人可以接管。
@@ -54,7 +54,7 @@ port:9222        exclusive   def-208 调试端口     8s     9912
 
 ```powershell
 & $LEASE release <leaseId>              # 释放单个
-& $LEASE release --all -Owner atk-3     # 释放某个 agent 的全部
+& $LEASE release --all -Owner agent-a     # 释放某个 agent 的全部
 ```
 
 ### run —— 持租约执行(最实用)
