@@ -770,7 +770,7 @@ export const CLASSES = Object.freeze({
   }),
 
   browser: defineClass('browser', {
-    summary: 'browser:instance (the container), browser:profile:<name>, browser:cdp:<port>, or a legacy opaque subject.',
+    summary: 'browser:instance (the container), browser:profile:<name>, browser:cdp:<port>, browser:origin:<host>, or a legacy opaque subject.',
     parts: (rough) => {
       if (rough.subject === 'instance') {
         return { subject: 'instance', qualifiers: [] }
@@ -788,6 +788,29 @@ export const CLASSES = Object.freeze({
           throw new Error('resource lease: browser:cdp needs exactly one port; write browser:cdp:9222')
         }
         return { subject: 'cdp', qualifiers: [canonicalPortSubject(rough.qualifiers[0])] }
+      }
+      if (rough.subject === 'origin') {
+        // One writer per origin. Different hosts do NOT conflict, which is the
+        // point: sharding agents by site turns "parallel writes" from unsafe
+        // into safe, because they no longer share server-side state. Two
+        // agents on the SAME origin still conflict, because a shared target
+        // has a read-modify-write window no browser-side scheme can close.
+        //
+        // Everything after `origin:` is one value, not colon-separated parts:
+        // callers paste URLs, and a scheme contains a colon.
+        const raw = rough.qualifiers.join(':')
+        const host = raw
+          .trim()
+          .toLowerCase()
+          .replace(/^[a-z]+:\/\//, '')
+          .replace(/\/.*$/, '')
+          .replace(/\.$/, '')
+        if (host === '' || host.includes('/') || /\s/.test(host)) {
+          throw new Error(
+            `resource lease: "${raw}" is not an origin host; write browser:origin:zhihu.com`,
+          )
+        }
+        return { subject: 'origin', qualifiers: [host] }
       }
       // Legacy/opaque: `browser:chromium` (v1 spelling). Kept permissive so v1
       // callers keep working; it compares by equality and claims no containment.

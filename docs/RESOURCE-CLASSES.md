@@ -361,3 +361,27 @@ BLOCKED on api:openai:rpm
 
 > 声明要**宽一点**(公共祖先把整片都罩住),TTL 要给**足一点**,多键要**一次拿完**。
 > 反过来做的每一种,都对应上面「常见误用」里的某一行。
+
+## 场景 8:多个 agent 各写不同网站
+
+**该声明**:`browser:origin:<host>`,每个 agent 一个站点。
+
+```
+agent A  ->  browser:origin:zhihu.com
+agent B  ->  browser:origin:juejin.cn
+agent C  ->  browser:origin:github.com
+```
+
+**mode**:`exclusive`(同一站点同一时刻只能一个写入者)。**TTL**:按任务给。
+
+**为什么这样能并行**:不同 host 之间**不冲突**,所以三个 agent 真正同时写,零协调。
+同一个 host 会冲突,因为共享目标的读-改-写窗口在服务端,浏览器侧关不掉。
+
+**典型冲突长什么样**:
+
+```
+Resource busy: browser:origin:zhihu.com held by agent-a (8s left, reason: 发文章)
+```
+
+**坑**:不要在这里申请 `browser:instance` —— 实例是容器,会挡住所有 origin,
+把本可以并行的分片任务重新串起来。

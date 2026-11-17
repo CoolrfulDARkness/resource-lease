@@ -70,7 +70,7 @@ rest     := 按 class 解析;除 path 外,subject 与 qualifier 以 ":" 分段
 | `path` | 转绝对路径 → Windows 下反斜杠转正斜杠、盘符小写、整串小写(大小写不敏感)→ 解析 `.`/`..` → 去尾部 `/`(根除外)。**不做符号链接解析**(见 §8 边界) |
 | `port` | 十进制整数,无前导零;区间用 `lo-hi` 且 `lo<=hi` |
 | `proc` | 作业名小写;`proc:pid:<n>` 表示具体 PID |
-| `browser` | `browser:instance` / `browser:profile:<name>` / `browser:cdp:<port>` |
+| `browser` | `browser:instance` / `browser:profile:<name>` / `browser:cdp:<port>` / `browser:origin:<host>` |
 | `screen` | `screen:focus`(固定)、`screen:pointer` |
 | `window` | `window:hwnd:<十进制>` |
 | `api` | `api:<provider>:<metric>`,metric ∈ {rpm, tpm, concurrent} |
@@ -171,7 +171,7 @@ lock.js 的准入逻辑因此是两层:`facetsConflict` 做 exclusive/shared 预
 | `path` | 相等,或一方是另一方的**路径祖先**(分段比较) |
 | `port` | 单值相等,或区间相交 |
 | `proc` | 相等 |
-| `browser` | 相等;**且** `browser:instance` 与任意 `browser:profile:*` / `browser:cdp:*` 冲突(实例是容器) |
+| `browser` | 相等;**且** `browser:instance` 与任意 `browser:profile:*` / `browser:cdp:*` / `browser:origin:*` 冲突(实例是容器)。**不同 `browser:origin:<host>` 之间不冲突** |
 | `screen` | 相等 |
 | `window` | 相等 |
 | `api` | 相等(名额由 pool slots 表达,不靠键) |
@@ -508,3 +508,27 @@ L-observe 要判断"这个 facet 是不是我自己持有的",而**持有者身�
 | `plugin/lib/index.js` | §7.1 §9(工具、guard、上下文) | 上两者 |
 | `cli/lease.ps1` | §7.2 §7.3(多键、退出码、同格式锁) | 本契约 |
 | `docs/*` | §8 边界、资源分类手册 | 本契约 |
+
+### 3.5 按 origin 分片:让并行写入变安全
+
+`browser:origin:<host>` 存在的唯一目的,是把"并行写入"从**不安全**变成**安全**,
+手段是**分片**而不是加锁。
+
+```
+不同 host 不冲突 → 两个 agent 各写各的站点,真并行,零协调
+同一 host 冲突   → 共享目标的读-改-写窗口无法从浏览器侧关闭,只能串行
+```
+
+**为什么必须这样**:实测(见 `tools/_e2e/E2E-RESULT.md`)表明,两个标签页并发写
+同一目标时,**服务端有 250ms 读改写窗口的情况下会静默丢一条,而两边都收到 HTTP 200**。
+浏览器侧的协调(一个标签、两个标签、两个 profile)对这个危险完全无效 ——
+窗口在服务端。能消除它的只有两种办法:
+
+1. **服务端乐观并发**(`If-Match` / ETag) —— 第三方站点不会为我们加
+2. **串行**,或者让它们根本不写同一个东西(**分片**)
+
+所以:分工给 agent 时**按站点分**,不是按任务分。任务可以按站点切,也可以按
+"读/写"切,但**同一时刻同一个 host 只能有一个写入者**。
+
+> 反面提示:如果一个 agent 拿 `browser:instance`,它会挡住所有 origin ——
+> 实例是容器。分片场景下**不要**申请 instance。

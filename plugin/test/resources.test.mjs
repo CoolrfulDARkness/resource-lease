@@ -648,3 +648,46 @@ test('facetsConflict throws on an unparseable facet instead of silently allowing
   assert.throws(() => facetsConflict('port:', 'exclusive', 'port:9222', 'exclusive'), /empty subject/)
   assert.throws(() => facetsConflict('port:9222', 'exclusive', 'nope', 'exclusive'), /not a resource key/)
 })
+
+// ---------------------------------------------------------------------------
+// browser:origin -- one writer per site, so that "parallel writes" becomes safe
+// by SHARDING instead of by locking. Different hosts must not conflict (that is
+// the whole point); the same host must, because a shared target has a
+// read-modify-write window no browser-side scheme can close.
+// ---------------------------------------------------------------------------
+
+test('browser:origin canonicalises case, scheme, trailing path and trailing dot', () => {
+  const want = 'browser:origin:zhihu.com'
+  assert.equal(canonicalKey('browser:origin:zhihu.com'), want)
+  assert.equal(canonicalKey('browser:origin:ZHIHU.com'), want)
+  assert.equal(canonicalKey('browser:origin:https://zhihu.com/explore'), want)
+  assert.equal(canonicalKey('browser:origin:zhihu.com.'), want)
+})
+
+test('browser:origin: different hosts do not conflict, the same host does', () => {
+  assert.equal(
+    keysConflict('browser:origin:zhihu.com', 'exclusive', 'browser:origin:juejin.cn', 'exclusive'),
+    false,
+    'two different sites must be able to write in parallel',
+  )
+  assert.equal(
+    keysConflict('browser:origin:zhihu.com', 'exclusive', 'browser:origin:ZHIHU.com', 'exclusive'),
+    true,
+    'the same site must serialise',
+  )
+})
+
+test('browser:instance still contains every origin', () => {
+  assert.equal(
+    keysConflict('browser:instance', 'exclusive', 'browser:origin:zhihu.com', 'exclusive'),
+    true,
+    'taking the whole browser container must block a per-origin writer',
+  )
+})
+
+test('browser:origin rejects an empty host or one containing whitespace', () => {
+  // An empty host is already caught by the generic "empty subject" guard before
+  // this class sees it; what matters is that it is rejected, not which message.
+  assert.throws(() => canonicalKey('browser:origin:'), /origin|subject/)
+  assert.throws(() => canonicalKey('browser:origin:a b'), /not an origin host/)
+})
