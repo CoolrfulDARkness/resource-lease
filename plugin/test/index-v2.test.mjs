@@ -641,3 +641,64 @@ test('[safety baseline] two agents both relying on auto-acquire: exactly one win
 
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('[H3 kill switch] globalMutex:false is reported as DEGRADED in resource_status and warns on load', async () => {
+  // The kill switch's entire safety property is that degrading must be LOUD. Without a
+  // permanent test, a refactor can silently drop the warning -- and silent degradation is
+  // exactly what the contract forbids ("never pretend the guarantee still holds").
+  // A safety exit with no test guarding it is not an exit.
+  const root = tmpRoot()
+  const { ctx, tools } = makeCtx()
+
+  // Capture the load-time warning. index.js reads ctx.logger.warn when it resolves the
+  // config, so replacing it before apply() is enough.
+  // makeLogger() only uses ctx.logger when it is a FACTORY function; this harness supplies
+  // an object, so the plugin falls back to console.warn. Capture that instead.
+  const warnings = []
+  const realWarn = console.warn
+  console.warn = (...args) => { warnings.push(args.map((v) => String(v)).join(' ')) }
+  try {
+    apply(ctx, { lockRoot: root, defaultTtlMs: 5000, globalMutex: false })
+  } finally {
+    console.warn = realWarn
+  }
+
+  const status = await run(tools, 'resource_status', {})
+  assert.equal(status.globalMutex.enabled, false, 'status must report the mutex as disabled')
+  assert.equal(status.globalMutex.mode, 'degraded')
+  assert.match(String(status.globalMutex.warning), /window is OPEN/i)
+  assert.match(status.text, /DEGRADED MODE/, 'the human/agent-readable text must say DEGRADED')
+  assert.match(status.text, /DISABLED/)
+
+  assert.equal(warnings.length >= 1, true, 'turning the mutex off must warn at load, not stay silent')
+  assert.match(warnings.join('\n'), /globalMutex is DISABLED/)
+  assert.match(warnings.join('\n'), /window is OPEN/)
+
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('[H3 kill switch] the default (mutex on) reports enforced and never says DEGRADED', async () => {
+  // The control: without this, a bug that hardcodes "degraded" would pass the test above.
+  const root = tmpRoot()
+  const { ctx, tools } = makeCtx()
+  const warnings = []
+  const realWarn = console.warn
+  console.warn = (...args) => { warnings.push(args.map((v) => String(v)).join(' ')) }
+  try {
+    apply(ctx, { lockRoot: root, defaultTtlMs: 5000 })
+  } finally {
+    console.warn = realWarn
+  }
+
+  const status = await run(tools, 'resource_status', {})
+  assert.equal(status.globalMutex.enabled, true, 'the mutex is on by default')
+  assert.equal(status.globalMutex.mode, 'enforced')
+  assert.doesNotMatch(status.text, /DEGRADED MODE/)
+  assert.equal(
+    warnings.some((message) => /globalMutex is DISABLED/.test(message)),
+    false,
+    'no kill-switch warning when the mutex is on',
+  )
+
+  fs.rmSync(root, { recursive: true, force: true })
+})

@@ -191,7 +191,12 @@ export function ensureLockRoot(lockRoot) {
  */
 export function readMeta(lockPath) {
   try {
-    const text = fs.readFileSync(lockPath, 'utf8')
+    // F3.4: an EPERM/EBUSY read is transient third-party interference, not an
+    // unreadable file. Retrying (with re-reads) before reporting null keeps
+    // "null" meaning "this file really has no readable body", which is what the
+    // takeover rules above rely on -- a false null here would arm rule 3
+    // ('stale-stat') against a live holder.
+    const text = retryTransientIo(() => fs.readFileSync(lockPath, 'utf8'))
     if (text.trim() === '') return null
     const parsed = JSON.parse(text)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
@@ -255,7 +260,7 @@ export function lockAgeMs(lockPath) {
 export function tryAcquire(lockPath, meta) {
   let fd
   try {
-    fd = fs.openSync(lockPath, 'wx')
+    fd = retryTransientIo(() => fs.openSync(lockPath, 'wx'))
     fs.writeFileSync(fd, JSON.stringify(meta))
     return true
   } catch (err) {
@@ -269,6 +274,54 @@ export function tryAcquire(lockPath, meta) {
         /* closing a descriptor that is already gone is not a lease problem */
       }
     }
+  }
+}
+
+/**
+ * Transient I/O failure helper (F3.4, task-9).
+ *
+ * Third-party interference (antivirus/indexer scanners) briefly opens lock files
+ * with non-shareable handles at creation time, which surfaces as EPERM/EBUSY on
+ * open/rename/unlink for a few milliseconds (measured: EPERM 20/1884 acquires at
+ * 32-way load, zero in 51,217 pure-Node O_EXCL races -- the interference is not
+ * Node-vs-Node). These errors are transient by nature, so the kernel retries a
+ * few times with millisecond backoff before giving up.
+ *
+ * Only EPERM/EBUSY are retried. Everything else -- ENOENT above all -- keeps its
+ * meaning: rename() uses ENOENT as its compare-and-swap answer, so retrying it
+ * would break the takeover protocol.
+ *
+ * Callers pass a closure and get its first non-transient result back; a closure
+ * that keeps throwing EPERM/EBUSY past the last delay rethrows to the caller,
+ * which keeps its existing failure semantics (usually "return false" / null).
+ * Every retry re-runs the closure, so id checks inside it are re-evaluated --
+ * a file swapped between attempts is judged by its CURRENT content.
+ */
+const TRANSIENT_RETRY_DELAYS_MS = [1, 2, 4, 8]
+
+function isTransientIoError(err) {
+  return err !== null && typeof err === 'object' && (err.code === 'EPERM' || err.code === 'EBUSY')
+}
+
+function retryTransientIo(fn) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return fn()
+    } catch (err) {
+      if (!isTransientIoError(err) || attempt >= TRANSIENT_RETRY_DELAYS_MS.length) throw err
+      sleepSync(TRANSIENT_RETRY_DELAYS_MS[attempt])
+    }
+  }
+}
+
+/** Unlink that rethrows transient errors (for retryTransientIo) and keeps the old removeLock() behaviour for everything else. */
+function unlinkTransientAware(lockPath) {
+  try {
+    fs.unlinkSync(lockPath)
+    return true
+  } catch (err) {
+    if (isTransientIoError(err)) throw err
+    return false
   }
 }
 
@@ -446,23 +499,36 @@ export function removeLock(lockPath) {
  *   deleted, and the id that was actually found on disk (null when unreadable).
  */
 export function removeIfOwned(lockPath, id) {
-  const meta = readMeta(lockPath)
-  if (meta === null) {
-    // Already gone (TTL purge, manual cleanup, or a half-written file): there is
-    // nothing to delete, and deleting "nothing" must not count as a release.
-    return { removed: false, onDiskId: null }
+  let outcome = { removed: false, onDiskId: null }
+  try {
+    // F3.4: the whole read -> verify id -> unlink sequence runs inside the retry,
+    // so every attempt re-judges the CURRENT file: a file swapped between attempts
+    // is never deleted on a stale belief. Only EPERM/EBUSY (transient third-party
+    // interference) trigger a retry; id mismatch and ENOENT return immediately,
+    // exactly like the un-retried version.
+    outcome = retryTransientIo(() => {
+      const meta = readMeta(lockPath)
+      if (meta === null) {
+        // Already gone (TTL purge, manual cleanup, or a half-written file): there is
+        // nothing to delete, and deleting "nothing" must not count as a release.
+        return { removed: false, onDiskId: null }
+      }
+      const onDiskId = typeof meta.id === 'string' ? meta.id : null
+      // Fail closed: anything other than an exact id match must keep the file.
+      // A lock file that parses but carries no string id (`{}`, `{"id":123}`, a
+      // file written by another tool/version) is NOT ours to delete -- deleting it
+      // would be a silent hijack of whatever holds that path. The CLI reaches the
+      // same conclusion (empty on-disk id -> remove nothing), so all three
+      // implementations agree on this edge case.
+      if (onDiskId === null || onDiskId !== id) {
+        return { removed: false, onDiskId }
+      }
+      return { removed: unlinkTransientAware(lockPath), onDiskId }
+    })
+  } catch {
+    /* transient retries exhausted: report not-removed, same as the old swallow */
   }
-  const onDiskId = typeof meta.id === 'string' ? meta.id : null
-  // Fail closed: anything other than an exact id match must keep the file.
-  // A lock file that parses but carries no string id (`{}`, `{"id":123}`, a
-  // file written by another tool/version) is NOT ours to delete -- deleting it
-  // would be a silent hijack of whatever holds that path. The CLI reaches the
-  // same conclusion (empty on-disk id -> remove nothing), so all three
-  // implementations agree on this edge case.
-  if (onDiskId === null || onDiskId !== id) {
-    return { removed: false, onDiskId }
-  }
-  return { removed: removeLock(lockPath), onDiskId }
+  return outcome
 }
 
 /**
@@ -631,6 +697,10 @@ export function listLocks(lockRoot) {
   }
   const out = []
   for (const name of names) {
+    // The acquire mutex is not a lease. A leading underscore is the CLI's own rule
+    // (`lease.ps1:1126, 1485`); without it, `sweep()` could archive the live mutex and
+    // two processes would enter the critical section at once.
+    if (name.startsWith('_')) continue
     if (!name.endsWith('.lock')) continue
     const full = path.join(lockRoot, name)
     const meta = readMeta(full)
@@ -841,6 +911,34 @@ function warnInvalidFacet(facet, error) {
   emitModelWarning(
     `resource-lease: "${text}" could not be ordered as a facet -- ${why} `
     + 'Its raw lowercase spelling is used as the order key instead, which may differ from another machine\'s order (G2).',
+  )
+}
+
+/**
+ * Report that an ACQUIRED key has required implications the alias tables cannot
+ * resolve (§3.3.1) -- once per distinct key per process.
+ *
+ * This is the §11.7-① observability fix. The default case: `browser:profile:<id>`
+ * with no directory alias expands to itself only, so a `path:` acquire of the
+ * real profile directory does NOT see it -- two agents can hold the same browser
+ * profile while each believes the other side is invisible. The protection gap is
+ * a configuration fact, not a kernel bug, and guessing default directories could
+ * map the wrong one (which is worse than an honest gap), so the kernel's duty is
+ * to make the gap loud instead of silent.
+ *
+ * @param {string} key the request key.
+ * @param {Array<{ id: string, key: string, hint: string }>} unresolved the model's unresolved-required report.
+ */
+function warnUnresolvedImplications(key, unresolved) {
+  const text = String(key)
+  const tag = `unresolved:${text}`
+  if (invalidWarned.has(tag)) return
+  invalidWarned.add(tag)
+  const ids = unresolved.map((row) => row?.id ?? '?').filter((id) => id !== 'optional').join(', ')
+  emitModelWarning(
+    `resource-lease: "${text}" is acquired WITHOUT full protection -- its required implications could not be resolved (${ids}). `
+    + 'It conflicts only with same-facet spellings, not with the underlying resource: configure the resource-lease aliases '
+    + '(or profileDirs) table for it, or another agent holding the underlying resource as a path: facet will not be excluded.',
   )
 }
 
@@ -1080,7 +1178,11 @@ function modesClash(modeA, modeB) {
 export function facetsClash(facetA, modeA, facetB, modeB) {
   if (!facetA || !facetB) return false
   if (!modesClash(modeA, modeB)) return false
-  const fn = tryModelFn('facetsConflict')
+  // rawFacetsConflict is the kernel's predicate: our inputs are already-expanded
+  // facets (expandFacets materialised the implications up front), so re-expanding
+  // inside the predicate would only burn hot-path reads. Falls back to the
+  // expanding facetsConflict for an older model that lacks the raw export.
+  const fn = tryModelFn('rawFacetsConflict') ?? tryModelFn('facetsConflict')
   if (fn === null) {
     // Fallback is exact-facet equality: it under-approximates (ancestor paths, port
     // ranges and cross-class implications are missed) but never invents a conflict.
@@ -1543,24 +1645,51 @@ export function localBackend(lockRoot, options = {}) {
     rename(from, to) {
       try {
         fs.mkdirSync(path.dirname(to), { recursive: true })
-        fs.renameSync(from, to)
+        // F3.2/F3.4: rename collisions with a briefly-held (EPERM/EBUSY) file are
+        // transient; retrying with re-runs makes the takeover dance's put-back
+        // survive a scanner holding the file open (the CH-3b stranding channel).
+        // ENOENT is NOT retried: it is the compare-and-swap answer.
+        retryTransientIo(() => fs.renameSync(from, to))
         return true
       } catch {
         return false
       }
     },
 
-    /** @returns {Array<{ path: string, meta: Record<string, any> | null, slot: number | null }>} every lock file. */
-    list() {
+    /**
+     * Every lock file, optionally prefiltered to the ones that could conflict with the
+     * given facet(s).
+     *
+     * The filter runs on the NAME, before the meta is read: reading every body is what
+     * made the critical section cost scale with the total number of leases (~0.45 ms per
+     * file), which is what queued 32 unrelated acquirers behind each other. Callers that
+     * need everything (release, sweep, status) simply pass no options.
+     *
+     * @param {{ forFacets?: string[] }} [options] facets to prefilter for.
+     * @returns {Array<{ path: string, meta: Record<string, any> | null, slot: number | null }>} matching lock files.
+     */
+    list(options = {}) {
       let names
       try {
         names = fs.readdirSync(root)
       } catch {
         return []
       }
+      // `prefilterSafe === false` means "a peer's file set may be incomplete, so the
+      // name-based inference cannot be trusted for this pass" -- read everything.
+      const wanted = options.prefilterSafe !== false && Array.isArray(options.forFacets) && options.forFacets.length > 0
+        ? options.forFacets
+        : null
       const out = []
       for (const name of names) {
+        // The acquire mutex is not a lease (CLI rule: `lease.ps1:1126, 1485`). Skipping
+        // it here is what keeps `sweep()` from archiving a live mutex -- the single
+        // point of failure for the whole mutex scheme.
+        if (name.startsWith('_')) continue
         if (!name.endsWith('.lock')) continue
+        // Cheap name-level prefilter: skip a body read only when the file provably
+        // cannot conflict with any wanted facet.
+        if (wanted !== null && !wanted.some((facet) => scanCandidate(facet, name))) continue
         const full = path.join(root, name)
         const slotMatch = /\.slot-(\d+)\.lock$/.exec(name)
         out.push({
@@ -1736,6 +1865,602 @@ function pathsOfRecord(record) {
     }
   }
   return [...new Set(out)]
+}
+
+// ===========================================================================
+// The shared acquire mutex (`_global.lock`) -- same file, same protocol as the CLI
+// ===========================================================================
+//
+// WHY THIS EXISTS
+//   `O_CREAT|O_EXCL` only decides who wins for the SAME facet file. Two agents asking
+//   for `path:d:/out` and `path:d:/out/sub` touch two DIFFERENT files, so a pure
+//   O_EXCL strategy lets both win even though their facets overlap (ancestor /
+//   descendant, port range, browser<->port). The CLI solved this years ago by
+//   serializing "scan for cross-facet collisions, then create every facet file" under
+//   one mutex file; `cli/lease.ps1:135-142, 763-826` is the reference implementation
+//   and the docstring there describes exactly this hole:
+//       "agent A acquiring path:d:/out and agent B acquiring path:d:/out/sub touch two
+//        DIFFERENT files, so a pure O_EXCL strategy lets both win"
+//
+// PROTOCOL COMPATIBILITY (hard requirement -- otherwise CLI and plugin stop excluding
+// each other):
+//   path      <lockRoot>/_global.lock
+//   TTL       15000 ms
+//   wait cap  8000 ms          (a LIMIT, not the wait: the effective wait is
+//                               min(8000, the caller's own remaining budget))
+//   poll      20 ms
+//   body      { id, pid, host, createdAt, expiresAt, lockPath }   <- exactly 6 keys
+//   create    O_EXCL (openSync 'wx'), body written through the same descriptor
+//   takeover  TTL expired / same host + pid gone / unreadable and older than 2 s,
+//             then rename to `<path>.stale.<now>.<pid>` (the rename IS the CAS)
+//   release   read, compare id, delete only on match
+//
+// THE TWO THINGS THIS MUTEX MUST NEVER DO
+//   1. It must never run a liveness probe inside the critical section. `readProcStart`
+//      spawns PowerShell on Windows: 267 ms idle, ~5.3 s under 32-way load. A probe in
+//      here would serialize every acquisition at that cost.
+//   2. It must never be taken across the HOLDING period. It covers "scan + create"
+//      only; `releaseMany` / `rollback` / `sweep` / `statusOf` never take it (which is
+//      also why they cannot deadlock against it).
+//
+// BEING DEPRIVED WITHOUT KNOWING IT (the failure mode this design first missed)
+//   The mutex can be taken over by TTL alone, and a TTL takeover does NOT notify the
+//   previous holder. So a process can honestly believe it holds the mutex while the
+//   file on disk belongs to somebody else -- e.g. this process was suspended for
+//   >15 s inside the critical section. Anything that assumes "I hold the mutex, so I
+//   am the only one in the critical section" must therefore re-verify ownership right
+//   before it commits. See `acquireMany`, which verifies twice.
+
+/** Mutex file name inside the lock root (identical to the CLI's $GlobalLockName). */
+export const MUTEX_NAME = '_global.lock'
+
+/** Mutex lease TTL in ms (identical to the CLI's $GlobalLockTtlMs). */
+export const MUTEX_TTL_MS = 15000
+
+/**
+ * Protocol wait cap in ms (identical to the CLI's $GlobalLockWaitMs).
+ *
+ * This is a CEILING, never the wait itself: the effective wait is
+ * `min(MUTEX_WAIT_MS, caller's remaining budget)`, and callers that expressed no
+ * deadline at all get `MUTEX_NO_DEADLINE_WAIT_MS` instead. Waiting a flat 8 s would
+ * turn a 6-11 ms "fail fast" acquire into an 8 s one (an ~800x regression) and would
+ * make a `waitMs: 1000` caller block 8 s before discovering its own deadline passed.
+ */
+export const MUTEX_WAIT_MS = 8000
+
+/**
+ * Mutex wait cap for callers with NO deadline (`strategy:'fail'`, no `waitMs`).
+ *
+ * Such a caller expressed "do not wait", but it still has to pay for "somebody else is
+ * inside the critical section" -- and the wait is a QUEUE, not one section.
+ *
+ * The first version of this constant was sized as "one section x 10" (500 ms against a
+ * 22-46 ms section). That was the wrong object: 32 acquirers x ~16 ms of section is
+ * ~512 ms, so the tail of the queue was evicted with `MUTEX_TIMEOUT` on completely idle
+ * resources. Sized as a queue instead:
+ *
+ *     cap >= N_max x section_p95 x safety
+ *           = 128 x 3 ms x 3 = 1152 ms  ->  1200 ms
+ *
+ * N_max = 128 concurrent acquirers (2x the 64 we design for, headroom for the harness
+ * and the CLI), section_p95 = 3 ms (measured 0.39-0.57 ms of filtered scan + ~0.4 ms of
+ * O_EXCL create + one index write; 3 ms is the p95 with jitter), safety = 3.
+ * And a timeout no longer means "fail" anyway -- see the degraded path in acquireMany.
+ */
+export const MUTEX_NO_DEADLINE_WAIT_MS = 1200
+
+/**
+ * F3.6 (task-13): escalation step and ceiling for the no-deadline mutex wait.
+ *
+ * MUTEX_NO_DEADLINE_WAIT_MS was sized as "queue depth x fast-path section p95" --
+ * 128 x 3 ms x 3 = 1200 ms. That sizing is right for the fast path, but the section
+ * is NOT always the fast path: a K32 multi-facet acquire holds the mutex ~40 ms, and
+ * a loaded machine can stretch one section to seconds (measured hold-tenure max
+ * 7384 ms under a 16-hog load). No fixed cap can cover both regimes, so a caller
+ * that expressed NO deadline escalates instead: each time the cap is reached while
+ * the takeover rules above still declined to fire -- i.e. the holder is alive and
+ * unexpired, the queue is moving -- the cap grows by MUTEX_NO_DEADLINE_ESCALATE_MS
+ * up to MUTEX_NO_DEADLINE_MAX_MS. Degradation then happens only when the ceiling is
+ * exhausted (genuinely stuck or pathologically long), not whenever a queue outlives
+ * a fast-path-sized constant. Measured target: the K32 structural degradation
+ * (15/64) and the hog-stretched sections should serialize instead of degrading.
+ *
+ * Ceiling rationale: 12000 ms is bounded 3 s below the mutex TTL (15000 ms) -- if
+ * the holder is going to be TTL-expired anyway, the waiter still has time to see
+ * rule 1 fire and win the takeover before giving up; and the worst-case
+ * no-deadline wait stays finite and predictable. Callers pass the ceiling as
+ * `escalateTo`; acquireMany additionally clamps it to the caller's own remaining
+ * budget, so an escalated wait can never overrun the overall acquire deadline.
+ *
+ * fail-fast callers and explicit `waitMsCap` callers WITHOUT `escalateTo` keep the
+ * exact old behaviour: fail closed at their cap (mutex-acquire.test.mjs asserts both).
+ */
+export const MUTEX_NO_DEADLINE_ESCALATE_MS = 2000
+export const MUTEX_NO_DEADLINE_MAX_MS = 12000
+
+/** Poll interval while contending (identical to the CLI's `Start-Sleep -Milliseconds 20`). */
+export const MUTEX_POLL_MS = 20
+
+/** Bounded spin used by `mutexMode:'fail-fast'` before giving up (one CLI poll). */
+export const MUTEX_FAST_SPIN_MS = 20
+
+/**
+ * Contention backoff for the mutex retry loop.
+ *
+ * The CLI polls every 20 ms (`Start-Sleep -Milliseconds 20`) and the first version copied
+ * that. It is the wrong constant for a CONTENDED O_EXCL create: `tryCreate` is atomic, so
+ * a 20 ms tick admits exactly ONE winner per tick -- 50 acquisitions/second no matter how
+ * cheap the critical section is. Measured: 32 waiters x ~20.7 ms of added latency each
+ * (661 ms total) while the section itself was 0.5-0.7 ms. The poll was 30-40x the thing it
+ * was protecting.
+ *
+ * So: retry almost immediately, then back off exponentially, capped at the old 20 ms, with
+ * +/-25% jitter so the 32 sleepers do not wake in lockstep (thundering herd).
+ */
+const MUTEX_RETRY_MIN_MS = 0.75
+const MUTEX_RETRY_MAX_MS = MUTEX_POLL_MS
+
+/**
+ * How old an UNREADABLE mutex file must be before it counts as a crashed residue
+ * (identical to the CLI's $StaleTakeoverGraceMs). A file that a live writer just
+ * created has no parseable body for a few milliseconds.
+ */
+const MUTEX_TAKEOVER_GRACE_MS = 2000
+
+// F3.3: how long the enter-verify grace re-read waits. A REJECTED takeover dance
+// parks the mutex file for 1-18 ms (p50 6ms, measured); 25 ms covers that window
+// with margin while keeping the anomalous path bounded. commit-verify has NO
+// grace -- it is the last gate before the commit write and stays fail-closed.
+const MUTEX_VERIFY_GRACE_MS = 25
+
+/**
+ * Budget gates for the expensive part of the liveness judgement.
+ *
+ * `isOwnerAlive` has three cost tiers (`lock.js`: exists() -> procStart compare):
+ *   A. pid gone                -> `pidExists` only            ~0.037 ms  (reclaimable)
+ *   C. pid alive, no procStart -> `pidExists` only            ~0.037 ms  (assume alive)
+ *   B. pid alive, procStart    -> `readProcStart`             267 ms idle / 5.3 s loaded
+ * Only tier B is expensive, and all it buys is PID-reuse detection. So the budget
+ * gates below apply to tier B ONLY -- the cheap tiers must never be gated, or a dead
+ * lease could never be reclaimed on a small budget (a ghost lease).
+ */
+const PROCSTART_REFINE_MIN_BUDGET_MS = 600
+const PROBE_WORST_CASE_MS = 5300
+const PROBE_TIME_BUDGET_MS = 3000
+const PROBE_BUDGET_PER_ATTEMPT = 4
+const MAX_REENTRY_ATTEMPTS = 3
+const ACQUIRE_DEADLINE_MS = 8000
+
+/**
+ * Reentrancy state for this process. A nested acquire (e.g. an auto-acquire hook that
+ * fires while another acquire is running) must not deadlock on its own mutex: it
+ * simply shares the outer critical section.
+ */
+let mutexState = { id: null, pid: null, depth: 0 }
+
+/**
+ * Path of the shared acquire mutex for a backend.
+ *
+ * @param {Record<string, any>} backend backend with a `lockRoot`.
+ * @returns {string} absolute path.
+ */
+export function mutexPathFor(backend) {
+  const b = assertBackend(backend)
+  if (typeof b.lockRoot !== 'string' || b.lockRoot === '') {
+    throw new LeaseModelError('mutexPathFor() needs a backend with a lockRoot (the mutex is a local file)')
+  }
+  return path.join(b.lockRoot, MUTEX_NAME)
+}
+
+/**
+ * Rename the mutex aside as the takeover CAS, then RE-READ the archived copy.
+ *
+ * The re-read is the part the CLI does not do (`lease.ps1:807-810` renames and retries
+ * without looking at what it moved). Taking over a mutex by mistake puts two processes
+ * in the critical section at once, which is the one thing this mutex exists to prevent,
+ * so we pay one extra read: if the archived copy turns out to be an unexpired lease
+ * whose owner is alive, put it back and report failure.
+ *
+ * @param {Record<string, any>} b backend.
+ * @param {string} mutexPath mutex path.
+ * @param {number} now reference clock.
+ * @returns {boolean} true when this caller really moved a dead/expired mutex aside.
+ */
+function takeoverMutex(b, mutexPath, now) {
+  const archived = `${mutexPath}.stale.${now}.${process.pid}`
+  if (!b.rename(mutexPath, archived)) return false
+
+  const archivedMeta = b.read(archived)
+  if (archivedMeta !== null && !isExpired(archivedMeta, now)) {
+    // Deliberately NOT using isOwnerAlive here: it would read pidGated, and a
+    // `pidGated:false` record would answer "unknown/alive" forever -- a crashed mutex
+    // carrying that flag would then be un-takeable and wedge the whole lock root. The
+    // mutex therefore uses the CLI's three rules only (TTL / same-host pid gone /
+    // unreadable-and-old), never the pidGated-aware judgement.
+    const pid = toPid(ownerInfoOf(archivedMeta).pid)
+    const host = ownerInfoOf(archivedMeta).host
+    const sameHost = typeof host === 'string' && host !== ''
+      && host.toLowerCase() === hostname().toLowerCase()
+    const ownerAlive = sameHost && pid !== null ? pidExists(pid) : true
+    if (ownerAlive) {
+      // We grabbed a live mutex (its owner was between create and its own release).
+      // Put it back, or two processes would sit in the critical section together.
+      if (b.rename(archived, mutexPath)) {
+        mutexTrace('takeover-outcome', {
+          outcome: 'put-back-live',
+          restoredId: archivedMeta.id ?? null,
+          restoredPid: pid,
+          restoredExpiresAt: archivedMeta.expiresAt ?? null,
+        })
+      } else {
+        // The put-back lost a race with a new creator: the live owner's mutex file
+        // is abandoned in the archive and whoever now owns mutexPath was created
+        // during the dance window. Purely observational -- the original code also
+        // returned false without looking at the rename result.
+        mutexTrace('takeover-outcome', {
+          outcome: 'put-back-failed',
+          abandonedId: archivedMeta.id ?? null,
+          abandonedPid: pid,
+          abandonedExpiresAt: archivedMeta.expiresAt ?? null,
+        })
+      }
+      return false
+    }
+  }
+  mutexTrace('takeover-outcome', {
+    outcome: 'won',
+    archivedId: archivedMeta !== null ? (archivedMeta.id ?? null) : null,
+    archivedPid: archivedMeta !== null ? toPid(archivedMeta.pid) : null,
+  })
+  return true
+}
+
+/**
+ * Enter the shared acquire mutex, or fail closed.
+ *
+ * @param {Record<string, any>} backend backend with a `lockRoot`.
+ * @param {{ waitMsCap?: number, mutexMode?: string }} [options] wait ceiling and mode.
+ * @returns {{ ok: boolean, id: string | null, nested?: boolean, code?: string, message?: string, waitedMs?: number }} handle.
+ */
+export function enterMutex(backend, options = {}) {
+  const b = assertBackend(backend)
+  if (typeof b.lockRoot !== 'string' || b.lockRoot === '') {
+    return { ok: false, id: null, code: 'MUTEX_UNAVAILABLE', message: 'backend has no lockRoot; the acquire mutex is a local file' }
+  }
+
+  // Reentrancy: this process already holds it, so share the outer critical section.
+  if (mutexState.depth > 0 && mutexState.pid === process.pid) {
+    mutexState.depth += 1
+    return { ok: true, id: mutexState.id, nested: true }
+  }
+
+  const mutexPath = mutexPathFor(b)
+  const requestedCap = Number.isFinite(options.waitMsCap)
+    ? Math.max(0, Math.trunc(options.waitMsCap))
+    : MUTEX_NO_DEADLINE_WAIT_MS
+  const failFast = options.mutexMode === 'fail-fast'
+  // F3.6 (task-13): a no-deadline caller may hand in an escalation ceiling; each
+  // time the cap is reached with the holder still alive (the takeover rules just
+  // declined), the cap grows by MUTEX_NO_DEADLINE_ESCALATE_MS up to this ceiling
+  // instead of timing out. fail-fast callers never escalate -- "fail fast" is the
+  // contract. Explicit caps without `escalateTo` keep the old fail-closed behaviour;
+  // passing BOTH an explicit waitMsCap and `escalateTo` escalates from the explicit
+  // cap (opt-in by design -- acquireMany never combines the two).
+  let capMs = failFast ? Math.min(requestedCap, MUTEX_FAST_SPIN_MS) : requestedCap
+  const escalateCeiling = !failFast && Number.isFinite(options.escalateTo)
+    ? Math.max(0, Math.trunc(options.escalateTo))
+    : null
+
+  const id = newLeaseId()
+  const startedAt = Date.now()
+  const host = hostname()
+  let tries = 0
+  // F3.5 (task-10, option A per DESIGN-ATTACK-CACHENONNULL.md): cache the holder
+  // body between contention retries, but ONLY a non-null holder, never null.
+  // F2 cached null too, and a cached null combined with a stat of an old file was
+  // the only thing that ever armed rule 3 against a live holder (Q1-LINK 15/15).
+  // With null never cached, that arm is structurally gone: rule 3 fires only on
+  // a FRESH null read, i.e. a genuinely unreadable file. A cached holder is safe
+  // for rules 1/2: its expiresAt/pid cannot change while the same record is on
+  // disk (mutex files are write-once-then-rename/remove), and rule 1 re-judges
+  // with the CURRENT clock, so a cached expiry is at most one cache-TTL late.
+  let cachedHolder = null
+  let skipReadUntil = 0
+
+  for (;;) {
+    const now = Date.now()
+    const meta = {
+      // Exactly the CLI's six keys. Adding owner/reason/facet here would be harmless to
+      // the CLI's parser, but keeping the shape identical is what makes the two
+      // implementations interchangeable, and it keeps `facetsOfMeta()` empty for the
+      // mutex (which is why the facet scanners ignore it).
+      id,
+      pid: process.pid,
+      host,
+      createdAt: now,
+      expiresAt: now + MUTEX_TTL_MS,
+      lockPath: mutexPath,
+    }
+
+    if (b.tryCreate(mutexPath, meta)) {
+      mutexState = { id, pid: process.pid, depth: 1 }
+      return { ok: true, id, nested: false, waitedMs: Date.now() - startedAt, enteredAt: Date.now() }
+    }
+
+    // ---- contention path (the fast path above ran no probe, exactly like the CLI) ----
+    // F3.5: holder-body cache over NON-NULL reads only (see the declaration above).
+    // A null read always refreshes the cache to nothing, so the next iteration
+    // re-reads; the cached-null -> stale-stat arm of F2 cannot exist here.
+    const nowForRead = Date.now()
+    let existing
+    let existingFromCache = false
+    if (cachedHolder !== null && nowForRead < skipReadUntil) {
+      existing = cachedHolder
+      existingFromCache = true
+    } else {
+      existing = b.read(mutexPath)
+      if (existing !== null) {
+        cachedHolder = existing
+        const holderExpiry = Number(existing.expiresAt)
+        skipReadUntil = Number.isFinite(holderExpiry)
+          ? Math.min(holderExpiry, nowForRead + 50)
+          : nowForRead + 50
+      } else {
+        cachedHolder = null
+        skipReadUntil = 0
+      }
+    }
+    let take = false
+    let takeRule = null
+    let statAgeMs = null
+    let cachedTakeConfirmed = false
+    // F3.5.1: a take decided on CACHED evidence must be confirmed against the
+    // CURRENT file before any dance fires. The holder may have been replaced
+    // inside the cache window; dancing on the stale body is a guaranteed
+    // guard-rejected retry burst (measured at K32: degraded 24/64 vs 17/64, wall
+    // 1.86x). One fresh read per cached take confirms or refutes; the dance only
+    // ever fires on fresh evidence. At most two passes: the second pass runs on
+    // fresh evidence and breaks unconditionally.
+    for (;;) {
+      if (existing !== null) {
+        const existingExpiry = Number(existing.expiresAt)
+        if (!Number.isFinite(existingExpiry) || existingExpiry < now) {
+          take = true // rule 1: TTL expired (judged with the CURRENT clock)
+          takeRule = 'ttl'
+        } else {
+          const existingHost = typeof existing.host === 'string' ? existing.host : ''
+          const existingPid = toPid(existing.pid)
+          // rule 2: same host and the pid is gone. Only pid existence is consulted --
+          // never procStart and never pidGated (see takeoverMutex's comment).
+          if (existingHost !== '' && existingHost.toLowerCase() === host.toLowerCase()
+              && existingPid !== null && pidExists(existingPid) === false) {
+            take = true
+            takeRule = 'pid-gone'
+          }
+        }
+      } else {
+        const st = b.stat(mutexPath)
+        // rule 3: unreadable body, but only once it is old enough to be a residue.
+        // Reachable ONLY via a fresh null read (F3.5 never caches null) -- i.e. the
+        // file really is unreadable right now, not "it was unreadable a moment ago".
+        statAgeMs = st !== null ? now - st.mtimeMs : null
+        if (st !== null && now - st.mtimeMs > MUTEX_TAKEOVER_GRACE_MS) {
+          take = true
+          takeRule = 'stale-stat'
+        }
+      }
+      if (!take || !existingFromCache) break
+      // Cached evidence fired a take: refresh and re-judge before dancing.
+      const staleRule = takeRule
+      const staleId = existing.id ?? null
+      existing = b.read(mutexPath)
+      existingFromCache = false
+      cachedTakeConfirmed = true
+      if (existing !== null) {
+        cachedHolder = existing
+        const holderExpiry = Number(existing.expiresAt)
+        skipReadUntil = Number.isFinite(holderExpiry)
+          ? Math.min(holderExpiry, Date.now() + 50)
+          : Date.now() + 50
+      } else {
+        cachedHolder = null
+        skipReadUntil = 0
+      }
+      mutexTrace('take-refuted', {
+        staleRule,
+        cachedId: staleId,
+        freshId: existing !== null ? (existing.id ?? null) : null,
+        freshNull: existing === null,
+      })
+      // Reset the verdict and re-run the rules on the FRESH body: the loop runs at
+      // most twice because existingFromCache is now false, which breaks the next
+      // pass unconditionally.
+      take = false
+      takeRule = null
+      statAgeMs = null
+      continue
+    }
+
+    if (take) {
+      mutexTrace('steal-decision', {
+        rule: takeRule,
+        existingSource: existing !== null ? (cachedTakeConfirmed ? 'fresh-confirmed' : (existingFromCache ? 'cached-holder' : 'fresh')) : 'fresh-null',
+        cachedTakeConfirmed,
+        mutexFileAgeMs: statAgeMs,
+        holderPid: existing !== null ? toPid(existing.pid) : null,
+        holderHost: existing !== null && typeof existing.host === 'string' ? existing.host : null,
+        holderExpiresAt: existing !== null ? (existing.expiresAt ?? null) : null,
+        selfWaitedMs: Date.now() - startedAt,
+      })
+      if (takeoverMutex(b, mutexPath, now)) continue // CAS won: retry the create
+    }
+
+    // Exponential backoff with jitter: a fixed tick lets exactly one waiter through per
+    // tick, so jitter is what lets several staggered retries find the gap in one window.
+    tries += 1
+    const backoff = Math.min(MUTEX_RETRY_MAX_MS, MUTEX_RETRY_MIN_MS * Math.pow(2, Math.min(tries, 5)))
+    const jittered = backoff * (0.75 + Math.random() * 0.5)
+
+    const waited = Date.now() - startedAt
+    if (waited >= capMs) {
+      if (escalateCeiling !== null && capMs < escalateCeiling) {
+        // F3.6 (task-13): the rules above just declined to fire, i.e. the holder is
+        // alive and unexpired -- the wait is a moving queue, not a stuck mutex.
+        // Extend the cap in bounded steps and keep queueing instead of degrading.
+        const next = Math.min(escalateCeiling, waited + MUTEX_NO_DEADLINE_ESCALATE_MS)
+        mutexTrace('mutex-escalate', { fromMs: capMs, toMs: next, waitedMs: waited })
+        capMs = next
+      } else {
+        return {
+          ok: false,
+          id: null,
+          code: failFast ? 'MUTEX_BUSY' : 'MUTEX_TIMEOUT',
+          message: `waited ${waited} ms for the acquire mutex '${mutexPath}' (cap ${capMs} ms); the holder is slow or stuck`,
+          waitedMs: waited,
+        }
+      }
+    }
+    retrySleepSync(Math.min(jittered, Math.max(0.2, capMs - waited)))
+  }
+}
+
+/**
+ * Leave the shared acquire mutex, deleting it only while it is still ours.
+ *
+ * When this process was deprived (TTL takeover), the id on disk no longer matches and
+ * nothing is deleted -- deleting here would remove the NEW holder's mutex and put two
+ * processes in the critical section.
+ *
+ * @param {Record<string, any>} backend backend with a `lockRoot`.
+ * @param {{ ok: boolean, id: string | null, nested?: boolean } | null} handle handle from enterMutex().
+ * @returns {boolean} true when the mutex was released by this call.
+ */
+export function exitMutex(backend, handle) {
+  if (!handle || handle.ok !== true) return false
+  if (handle.nested === true) {
+    if (mutexState.depth > 0) mutexState.depth -= 1
+    return false
+  }
+  mutexState = { id: null, pid: null, depth: 0 }
+  const b = assertBackend(backend)
+  let mutexPath
+  try {
+    mutexPath = mutexPathFor(b)
+  } catch {
+    return false
+  }
+  if (handle.enteredAt !== undefined) {
+    mutexTrace('hold-tenure', { selfHeldForMs: Date.now() - handle.enteredAt, mutexId: handle.id })
+  }
+  const removed = b.remove(mutexPath, handle.id)
+  if (!removed && MUTEX_TRACE_DIR !== null) {
+    let onDisk = null
+    try { onDisk = b.read(mutexPath) } catch { /* diagnostic only */ }
+    mutexTrace('exit-result', {
+      removed: false,
+      mutexId: handle.id,
+      onDiskId: onDisk !== null && typeof onDisk.id === 'string' ? onDisk.id : null,
+      onDiskPid: onDisk !== null ? toPid(onDisk.pid) : null,
+    })
+  }
+  return removed
+}
+
+/**
+ * Sleep for a possibly sub-millisecond interval.
+ *
+ * `Atomics.wait` truncates its timeout to whole milliseconds, so a 0.75 ms backoff would
+ * become "no wait at all" and turn into a hot loop. Sub-1 ms waits spin on the high
+ * resolution clock instead; that is bounded by MUTEX_RETRY_MIN_MS, so it costs at most a
+ * fraction of a millisecond of CPU per retry.
+ *
+ * @param {number} ms milliseconds.
+ */
+function retrySleepSync(ms) {
+  if (!(ms > 0)) return
+  if (ms < 1) {
+    const until = process.hrtime.bigint() + BigInt(Math.round(ms * 1e6))
+    while (process.hrtime.bigint() < until) { /* sub-ms */ }
+    return
+  }
+  sleepSync(Math.min(Math.round(ms), MUTEX_RETRY_MAX_MS))
+}
+
+// ---------------------------------------------------------------------------
+// Attribution tracing (log-only, no control flow): one JSONL line per mutex
+// event while DSH_MUTEX_TRACE names a directory. With the variable unset this
+// costs two boolean checks per event site and nothing else; it never writes
+// inside a lock root (the trace dir is caller-supplied) and never fails an
+// acquire -- trace errors are swallowed by design.
+// ---------------------------------------------------------------------------
+
+const MUTEX_TRACE_DIR = (typeof process.env.DSH_MUTEX_TRACE === 'string' && process.env.DSH_MUTEX_TRACE.trim() !== '')
+  ? process.env.DSH_MUTEX_TRACE.trim()
+  : null
+let mutexTracePath = null
+
+function mutexTrace(event, fields) {
+  if (MUTEX_TRACE_DIR === null) return
+  try {
+    if (mutexTracePath === null) {
+      fs.mkdirSync(MUTEX_TRACE_DIR, { recursive: true })
+      mutexTracePath = path.join(MUTEX_TRACE_DIR, `trace-${process.pid}.jsonl`)
+    }
+    fs.appendFileSync(mutexTracePath, JSON.stringify({ ts: Date.now(), pid: process.pid, event, ...fields }) + '\n')
+  } catch {
+    /* tracing must never break an acquire */
+  }
+}
+
+/**
+ * Whether this process still owns the mutex it believes it holds.
+ *
+ * FAIL-CLOSED on purpose. Only "read succeeded AND the id matches" counts as holding:
+ *   - read returns null  -> the depriver already renamed the old file away and released,
+ *     so "no file" is EVIDENCE OF DEPRIVATION, not evidence of "nothing changed";
+ *   - read throws        -> we cannot prove ownership;
+ *   - id differs         -> obviously not ours.
+ * Any of those must end the attempt instead of committing on a false belief.
+ *
+ * @param {Record<string, any>} backend backend.
+ * @param {{ id: string | null } | null} handle handle from enterMutex().
+ * @returns {boolean} true only when ownership is proven right now.
+ */
+export function holdsMutex(backend, handle, context = null) {
+  if (!handle || handle.ok !== true) return false
+  const b = assertBackend(backend)
+  let mutexPath
+  try {
+    mutexPath = mutexPathFor(b)
+  } catch {
+    return false
+  }
+  const tracePhase = context !== null && typeof context === 'object' && typeof context.phase === 'string'
+    ? context.phase
+    : null
+  try {
+    const meta = b.read(mutexPath)
+    const held = meta !== null && typeof meta.id === 'string' && meta.id === handle.id
+    if (!held && MUTEX_TRACE_DIR !== null) {
+      mutexTrace('verify-fail', {
+        phase: tracePhase,
+        selfId: handle.id,
+        onDiskId: meta !== null && typeof meta.id === 'string' ? meta.id : null,
+        onDiskPid: meta !== null ? toPid(meta.pid) : null,
+        onDiskCreatedAt: meta !== null ? (meta.createdAt ?? null) : null,
+        onDiskExpiresAt: meta !== null ? (meta.expiresAt ?? null) : null,
+        onDiskNull: meta === null,
+      })
+    }
+    return held
+  } catch (err) {
+    mutexTrace('verify-fail', {
+      phase: tracePhase,
+      selfId: handle.id,
+      readThrew: err !== null && typeof err === 'object' && 'code' in err ? err.code : String(err),
+    })
+    return false
+  }
 }
 
 // ===========================================================================
@@ -2016,6 +2741,209 @@ function facetOfMeta(meta) {
   return facets.length > 0 ? facets[0] : ''
 }
 
+// ---------------------------------------------------------------------------
+// Cheap filename-level prefilter for the critical-section scan
+// ---------------------------------------------------------------------------
+//
+// WHY: the scan used to read the meta of EVERY lock file in the root (~0.45 ms each),
+// so the critical section cost grew with the total number of leases -- 32 unrelated
+// facets meant ~15 ms of reads, and 32 processes queueing on that pushed the tail past
+// the mutex wait cap. But the file NAME already encodes the facet's class, and for
+// `path` it encodes the subject too, so most files can be ruled out without reading them.
+//
+// SOUNDNESS: every lease writes one file per facet, so a holder that could conflict
+// always has a file whose name is in the wanted facet's class. Cross-class implications
+// are already materialised as extra facets by expandFacets (browser:cdp:<p> yields both
+// a browser and a port facet), and container rules (browser:instance vs browser:*) stay
+// inside one class. `screen:focus` vs `window:*` must NOT conflict (§3.3), so skipping
+// other classes is the correct behaviour there, not a shortcut.
+//
+// DEFENSIVE: a file whose name does not look like a known class (a hand-written or
+// legacy file) is NEVER skipped -- it still gets read, so manual writers stay visible.
+
+const KNOWN_CLASS_NAMES = new Set(['path', 'port', 'proc', 'browser', 'screen', 'window', 'api', 'named'])
+
+/**
+ * Class of a canonical facet ("path:d:/out" -> "path").
+ *
+ * @param {string} facet facet.
+ * @returns {string} lowercased class, or '' when there is no separator.
+ */
+function facetClass(facet) {
+  const text = String(facet)
+  const at = text.indexOf(':')
+  return at <= 0 ? '' : text.slice(0, at).toLowerCase()
+}
+
+/**
+ * Whether two sanitised names could be in an ancestor/descendant relation.
+ *
+ * sanitizeKey maps ':' and '/' to '_' one-to-one and lowercases, so for `path` an
+ * ancestor's sanitised form is always a prefix of the descendant's. The boundary check
+ * is what keeps `path:d:/out` and `path:d:/out2` apart; a name that already ends with a
+ * separator (a root such as `d:/`) is a boundary in itself.
+ *
+ * @param {string} a one sanitised name.
+ * @param {string} b the other sanitised name.
+ * @returns {boolean} true when a read is worth doing.
+ */
+function sanitizedMayBeAncestor(a, b) {
+  if (a === b) return true
+  if (a.length < b.length && b.startsWith(a)) return a.endsWith('_') || b[a.length] === '_'
+  if (b.length < a.length && a.startsWith(b)) return b.endsWith('_') || a[b.length] === '_'
+  return false
+}
+
+/**
+ * Whether a lock file name is worth reading for a wanted facet.
+ *
+ * @param {string} wantFacet the facet we are trying to claim.
+ * @param {string} fileName basename of a lock file.
+ * @returns {boolean} false only when the file provably cannot conflict.
+ */
+function scanCandidate(wantFacet, fileName) {
+  const base = String(fileName).replace(/\.slot-\d+\.lock$/, '').replace(/\.lock$/, '')
+  const wantedClass = facetClass(wantFacet)
+  if (wantedClass === '') return true
+  const candidateClass = base.split('_')[0]
+  if (!KNOWN_CLASS_NAMES.has(candidateClass)) return true // unknown shape: keep it visible
+  if (candidateClass !== wantedClass) return false
+  // Same class: only `path` has a cheap subject test (ancestor/descendant).
+  if (wantedClass === 'path') return sanitizedMayBeAncestor(keyBase(wantFacet), base)
+  return true // port ranges / browser containers need the body
+}
+// ---------------------------------------------------------------------------
+// `_pending` markers: how the name prefilter stays SOUND
+// ---------------------------------------------------------------------------
+//
+// The prefilter above decides which bodies to read from the FILE NAME. That inference
+// assumes a lease's file set is COMPLETE -- and it is not, in two reachable states:
+//
+//   1. crash between two `createFacet` calls: `browser_cdp_9222.lock` exists and its body
+//      declares `port:9222`, but `port_9222.lock` was never written;
+//   2. the DEGRADED path (no mutex, see acquireMany) is mid-create while another process
+//      scans -- both are alive, so this one can produce a real double hold.
+//
+// Both look identical from the outside: "some file exists whose body names a facet whose
+// own file does not exist yet". A multi-key lease makes this worse -- ANY class's file can
+// declare ANY class's facet, so restricting the prefilter to `path` is not sound either.
+//
+// The fix makes completeness OBSERVABLE instead of assumed: before creating its first
+// facet a lease writes `_pending/<leaseId>` (an empty file, the name IS the id), and it
+// removes that file only after every facet and the index are written. A scanner that sees
+// a FOREIGN pending marker must not trust the name filter for that pass.
+//
+// Cost: one `readdir` of a normally-empty directory (<0.1 ms) plus one create and one
+// delete that were already in the P1 budget.
+
+/** Directory of in-flight lease markers, inside the lock root. */
+export const PENDING_DIR = '_pending'
+
+/**
+ * Path of the pending-marker directory.
+ *
+ * @param {Record<string, any>} backend backend with a lockRoot.
+ * @returns {string} absolute directory path.
+ */
+export function pendingDirFor(backend) {
+  const b = assertBackend(backend)
+  if (typeof b.lockRoot !== 'string' || b.lockRoot === '') {
+    throw new LeaseModelError('pendingDirFor() needs a backend with a lockRoot')
+  }
+  return path.join(b.lockRoot, PENDING_DIR)
+}
+
+/**
+ * Mark a lease as in-flight (written BEFORE its first facet file).
+ *
+ * @param {Record<string, any>} backend backend.
+ * @param {string} id lease id.
+ * @returns {boolean} true when the marker exists afterwards.
+ */
+export function writePending(backend, id) {
+  if (!isSafeLeaseId(id)) return false
+  try {
+    const dir = pendingDirFor(backend)
+    const file = path.join(dir, id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(file, '', { flag: 'w' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Remove a lease's pending marker (after its file set is complete, or on rollback).
+ *
+ * @param {Record<string, any>} backend backend.
+ * @param {string} id lease id.
+ */
+export function clearPending(backend, id) {
+  if (!isSafeLeaseId(id)) return
+  try {
+    fs.rmSync(path.join(pendingDirFor(backend), id), { force: true })
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Pending markers belonging to OTHER leases.
+ *
+ * @param {Record<string, any>} backend backend.
+ * @param {string} ownId our own lease id (excluded).
+ * @returns {string[]} foreign in-flight ids.
+ */
+export function foreignPending(backend, ownId) {
+  let names
+  try {
+    names = fs.readdirSync(pendingDirFor(backend))
+  } catch {
+    // A backend without a lockRoot (a future broker) has no marker directory; treating
+    // that as "no foreign markers" keeps the prefilter decision local and never throws
+    // from a scan.
+    return []
+  }
+  return names.filter((name) => name !== ownId && isSafeLeaseId(name))
+}
+
+/**
+ * Drop pending markers left behind by crashed creators (older than the mutex TTL).
+ *
+ * Only called while holding the mutex, so the caller is the one process that can safely
+ * decide a marker is abandoned: a live degraded creator finishes its create phase in
+ * milliseconds, so anything this old is a corpse. Without this, one crashed multi-facet
+ * create would permanently disable the prefilter (every scan would see a foreign marker).
+ *
+ * @param {Record<string, any>} backend backend.
+ * @param {number} now reference clock.
+ * @returns {number} how many markers were removed.
+ */
+export function purgeStalePending(backend, now = Date.now()) {
+  let dir
+  let names
+  try {
+    dir = pendingDirFor(backend)
+    names = fs.readdirSync(dir)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const name of names) {
+    if (!isSafeLeaseId(name)) continue
+    try {
+      const st = fs.statSync(path.join(dir, name))
+      if (now - st.mtimeMs > MUTEX_TTL_MS) {
+        fs.rmSync(path.join(dir, name), { force: true })
+        removed += 1
+      }
+    } catch {
+      /* raced with its owner */
+    }
+  }
+  return removed
+}
 /**
  * Describe a blocker for the §4.3 conflict report.
  *
@@ -2024,7 +2952,7 @@ function facetOfMeta(meta) {
  * @param {number} now reference clock.
  * @returns {{ facet: string, heldBy: Record<string, any>, reason: string, expiresInMs: number | null, mode: string }} conflict row.
  */
-function conflictRow(facet, meta, now) {
+function conflictRow(facet, meta, now, lockPath) {
   const info = ownerInfoOf(meta)
   const expiresAt = Number(meta && meta.expiresAt)
   return {
@@ -2038,6 +2966,16 @@ function conflictRow(facet, meta, now) {
     reason: meta && typeof meta.reason === 'string' ? meta.reason : '',
     expiresInMs: Number.isFinite(expiresAt) ? Math.max(0, Math.trunc(expiresAt - now)) : null,
     mode: meta && typeof meta.mode === 'string' ? meta.mode : 'exclusive',
+    // The blocking file, so the caller can judge liveness on it OUTSIDE the mutex
+    // without re-deriving the path (a facet may live in a pool slot, and the row must
+    // name the exact file that blocked us).
+    lockPath: typeof lockPath === 'string' && lockPath !== ''
+      ? lockPath
+      : (typeof meta?.lockPath === 'string' && meta.lockPath !== '' ? meta.lockPath : null),
+    // When this snapshot was taken. A conflict row is a MOMENT, not a live view: by the
+    // time a caller reads it the holder may have released or been taken over. Field names
+    // must never imply "currently held".
+    observedAtMs: now,
   }
 }
 
@@ -2146,13 +3084,19 @@ function claimFacet(backend, want, ctx) {
       if (incumbent !== null && incumbent.id === id) {
         continue // already ours (a retry after a partial pass)
       }
+      // Inside the mutex (phase 1) we must not reclaim: `reclaimLock` judges liveness,
+      // which costs 267 ms-5.3 s. Report the blocker and let the caller decide outside.
+      if (ctx.options.noReclaim === true) {
+        slotBlocker = { facet: want.facet, meta: incumbent, why: 'held by another lease (reported from inside the acquire mutex, liveness not judged)', slot, lockPath }
+        break
+      }
       const reclaimed = reclaimLock(backend, lockPath, {
         ...options,
         now,
         meta: incumbent,
       })
       if (!reclaimed.reclaimed) {
-        slotBlocker = { facet: want.facet, meta: incumbent, why: reclaimed.why, slot }
+        slotBlocker = { facet: want.facet, meta: incumbent, why: reclaimed.why, slot, lockPath }
         break
       }
       // Collected the dead/expired incumbent: one more pass claims the path.
@@ -2160,7 +3104,7 @@ function claimFacet(backend, want, ctx) {
     if (!slotBlocker) {
       // tryCreate kept losing without a reclaim (three takeover passes): the slot is
       // contended by live writers. Report it instead of silently moving on.
-      slotBlocker = { facet: want.facet, meta: null, why: 'could not claim the slot after 3 takeover passes', slot }
+      slotBlocker = { facet: want.facet, meta: null, why: 'could not claim the slot after 3 takeover passes', slot, lockPath }
     }
     if (lastBlocker === null) lastBlocker = slotBlocker
   }
@@ -2168,8 +3112,8 @@ function claimFacet(backend, want, ctx) {
   if (lastBlocker) {
     const meta = lastBlocker.meta
     const row = meta
-      ? conflictRow(want.facet, meta, now)
-      : { facet: want.facet, heldBy: { agent: null, session: null, pid: null, host: null }, reason: '', expiresInMs: null, mode: want.mode }
+      ? conflictRow(want.facet, meta, now, lastBlocker.lockPath ?? null)
+      : { facet: want.facet, heldBy: { agent: null, session: null, pid: null, host: null }, reason: '', expiresInMs: null, mode: want.mode, lockPath: lastBlocker.lockPath ?? null, observedAtMs: now }
     // A pool that found every slot taken must say so ("capacity"), not report the
     // last slot's individual holder as if the whole facet were exclusive.
     const detail = want.mode === 'pool'
@@ -2205,9 +3149,39 @@ function claimFacet(backend, want, ctx) {
  */
 function findFacetConflict(backend, want, ctx) {
   const now = ctx.now
-  for (const entry of backend.list()) {
+  // Prefiltered enumeration: only files whose NAME could clash with this facet get their
+  // body read. This is what keeps the critical section short when many unrelated leases
+  // exist (the 32-idle-acquirers case).
+  const candidates = typeof backend.list === 'function'
+    ? backend.list({ forFacets: [want.facet], prefilterSafe: ctx.options.prefilterSafe !== false })
+    : backend.list()
+  for (const entry of candidates) {
     const meta = entry.meta
-    if (meta === null) continue
+    if (meta === null) {
+      // An unreadable body is NOT "no lock here": a live writer looks exactly like this
+      // for the few milliseconds between openSync('wx') and its first write. Without a
+      // body there are no facets to compare, so we cannot tell whether it clashes -- and
+      // a silent `continue` would be a fail-open hole in the very scan that is supposed
+      // to close the ancestor/range window. Only an aged residue is safely ignorable
+      // (it is crashed garbage and the next reclaim will collect it); a fresh one is
+      // reported as a conflict.
+      const st = backend.stat(entry.path)
+      if (st !== null && now - st.mtimeMs < MUTEX_TAKEOVER_GRACE_MS) {
+        return {
+          facet: want.facet,
+          heldBy: { agent: null, session: null, pid: null, host: null },
+          reason: '',
+          expiresInMs: null,
+          mode: want.mode,
+          lockPath: entry.path,
+          observedAtMs: now,
+          detail: 'unreadable lock file younger than the takeover grace (possible live writer)',
+          livenessRefined: false,
+          livenessVerdict: 'unknown (unreadable body, not judged)',
+        }
+      }
+      continue
+    }
     if (meta.id === ctx.id) continue
     const heldFacets = facetsOfMeta(meta)
     if (heldFacets.length === 0) continue
@@ -2221,6 +3195,16 @@ function findFacetConflict(backend, want, ctx) {
       }
     }
     if (!clash) continue
+
+    // ---- phase 1 (inside the mutex): NEVER judge liveness here ----
+    // A liveness probe costs 267 ms idle / ~5.3 s under load (it spawns PowerShell on
+    // Windows). Running one inside the critical section would serialize every
+    // acquisition at that cost, so phase 1 only reports "somebody holds a clashing
+    // facet"; the caller judges liveness outside the mutex and re-enters to re-scan.
+    if (ctx.options.noProbe === true) {
+      const row = conflictRow(want.facet, meta, now, entry.path)
+      return { ...row, livenessRefined: false, livenessVerdict: 'unknown (not probed inside the mutex)' }
+    }
 
     const alive = isOwnerAlive(meta, {
       now,
@@ -2317,11 +3301,48 @@ function sleepSync(ms) {
  * @param {Record<string, any>} backend LeaseBackend (see localBackend()).
  * @param {unknown} requests one request or an array, §7.1 shapes.
  * @param {Record<string, any>} [options] ttlMs, reason, owner, strategy, waitMs, probes.
+ *   R-2 CAVEAT: options here carry NO alias/profileDirs fields. Alias resolution for
+ *   acquires is process-wide state (resources.setAliases()/setProfileDirs(), wired
+ *   from the plugin config) -- unlike the public predicates, whose options argument
+ *   IS honoured per call. Passing { aliases: ... } here is silently ignored.
  * @returns {Record<string, any>} result object (see above).
  */
 export function acquireMany(backend, requests, options = {}) {
   const b = assertBackend(backend)
   const plan = planAcquisition(requests)
+
+  // §11.7-① observability: an acquired key whose required implications cannot be
+  // resolved under-protects silently -- say so once per key per process. One
+  // expandReport per DISTINCT raw key (cached by the once-per-key warn), outside
+  // every lock path's hot loop, best effort.
+  try {
+    const reportFn = tryModelFn('unresolvedAliases')
+    if (reportFn !== null) {
+      const seenKeys = new Set()
+      for (const request of requests) {
+        // §7.1 shapes reaching acquireMany are exactly two: "key" and
+        // { key, mode?, slots? }. planAcquisition() rejects anything else (a bare
+        // array is NOT a legal per-request shape) before this loop runs, so this
+        // coverage loop re-reads only the two legal raw spellings.
+        const rawKeys = typeof request === 'string'
+          ? [request]
+          : request !== null && typeof request === 'object' && request.key !== undefined
+            ? [request.key]
+            : []
+        for (const rawKey of rawKeys) {
+          const keyText = typeof rawKey === 'string' ? rawKey : null
+          if (keyText === null || seenKeys.has(keyText)) continue
+          seenKeys.add(keyText)
+          const unresolved = reportFn(keyText)
+          if (Array.isArray(unresolved) && unresolved.length > 0) {
+            warnUnresolvedImplications(keyText, unresolved)
+          }
+        }
+      }
+    }
+  } catch {
+    /* coverage reporting is best effort and must never fail an acquire */
+  }
 
   const ttlMs = Number(options.ttlMs)
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
@@ -2341,15 +3362,97 @@ export function acquireMany(backend, requests, options = {}) {
     procStart: options.procStart,
   })
 
-  const deadline = Date.now() + waitMs
+  // ---------------------------------------------------------------------------
+  // Budgets. ONE clock for all three of them (mutex wait, refinement, re-entries):
+  // they must not each start their own timer, or the totals add up.
+  // ---------------------------------------------------------------------------
+  const acquireStartedAt = Date.now()
+  const deadline = acquireStartedAt + waitMs
+  const hasDeadline = strategy === 'queue' && waitMs > 0
   const facets = plan.map((entry) => entry.facet)
+  const elapsed = () => Date.now() - acquireStartedAt
+  const budgetLeft = () => (hasDeadline
+    ? Math.max(0, deadline - Date.now())
+    : Math.max(0, ACQUIRE_DEADLINE_MS - elapsed()))
+
+  // The mutex is a local file, so a backend without a lockRoot (a future broker) cannot
+  // have one; `options.mutex === false` is the documented kill switch and is reported
+  // loudly by index.js -- never silently here.
+  const mutexEnabled = options.mutex !== false && typeof b.lockRoot === 'string' && b.lockRoot !== ''
+
+  // Counters for the observable `livenessRefined` flag, plus a diagnostic bag for the
+  // phase-2 skip reasons (cheap, and it turns "why was this not reclaimed?" into data
+  // instead of a guess).
+  const probeStats = { refined: 0, skipped: 0, dead: 0, reclaimProbes: 0, skipReasons: [] }
+  let probesUsed = 0
+  const baseProcStartOf = typeof options.procStartOf === 'function' ? options.procStartOf : readProcStart
+
+  /**
+   * Budgeted wrapper for the ONLY expensive part of `isOwnerAlive` (tier B: pid exists
+   * AND the record carries a procStart). Returning null makes `isOwnerAlive` fall back
+   * to "trust the pid" (alive) -- conservative, and it leaves the cheap tiers (pid gone
+   * -> dead, reclaimable) completely untouched, so a dead lease can ALWAYS be collected
+   * regardless of budget.
+   */
+  const budgetedProcStartOf = (pid, now) => {
+    if (elapsed() >= PROBE_TIME_BUDGET_MS
+      || probesUsed >= PROBE_BUDGET_PER_ATTEMPT
+      || budgetLeft() < PROCSTART_REFINE_MIN_BUDGET_MS
+      || ((options.refineMode ?? 'strict') === 'strict' && budgetLeft() < PROBE_WORST_CASE_MS)) {
+      probeStats.skipped += 1
+      return null
+    }
+    probesUsed += 1
+    probeStats.refined += 1
+    return baseProcStartOf(pid, now)
+  }
+
+  /**
+   * Probe wrapper for the RECLAIM decision (phase 2), which is a different budget class
+   * from the ENUMERATION decision (findRivals).
+   *
+   * Why they must not share one budget: phase 2 asks "can I collect THIS one file?" and
+   * stops at the first success (`break`), so it runs at most once per attempt -- its cost
+   * is bounded by construction. Phase 1/findRivals ask "how many opponents are there?",
+   * which scales with the number of clashing leases (`browser:instance` against 50
+   * browser leases), so THAT is what needs the tight gates.
+   *
+   * Gating the reclaim decision with the enumeration gates was a real bug: any caller
+   * whose budget is under PROBE_WORST_CASE_MS (e.g. `waitMs: 1000`) could then never
+   * refine, `isOwnerAlive` would answer "trust the pid -> alive", and a lease whose pid
+   * had been REUSED would never be collected -- turning "reclaim immediately" (G3) into
+   * "wait for the TTL". Skipping an enumeration probe just under-reports opponents
+   * (harmless); skipping a reclaim probe loses a guarantee.
+   *
+   * So this one is bounded only by the overall acquire deadline and the cumulative probe
+   * time budget, plus a hard cap of ONE per attempt.
+   */
+  const reclaimProcStartOf = (pid, now) => {
+    if (elapsed() >= PROBE_TIME_BUDGET_MS) {
+      probeStats.skipped += 1
+      return null
+    }
+    if (probeStats.reclaimProbes >= 1) {
+      probeStats.skipped += 1
+      return null
+    }
+    probeStats.reclaimProbes += 1
+    probesUsed += 1
+    probeStats.refined += 1
+    return baseProcStartOf(pid, now)
+  }
 
   let lastFailure = null
+  let reentries = 0
+
   for (;;) {
     const now = Date.now()
     const id = newLeaseId()
     /** @type {Array<{ facet: string, mode: string, slots: number, slot: number | null, lockPath: string }>} */
     const acquired = []
+    // Declared before ctx because ctx.options reads it; assigned once the mutex
+    // acquisition below has decided whether we are inside the critical section.
+    let haveMutex = false
     const ctx = {
       id,
       owner,
@@ -2357,99 +3460,357 @@ export function acquireMany(backend, requests, options = {}) {
       ttlMs,
       now,
       facets,
+      probeStats,
       // Grows as facets are claimed: each facet file names the paths claimed so far.
       claimedPaths: [],
       options: {
         host: options.host,
         pidExists: options.pidExists,
-        procStartOf: options.procStartOf,
+        // Inside the mutex nothing may probe; outside it may, within budget.
+        procStartOf: haveMutex ? budgetedProcStartOf : (options.procStartOf ?? readProcStart),
         procStartToleranceMs: options.procStartToleranceMs,
         warn: options.warn,
+        // Phase-1 rules: report blockers, judge nothing.
+        noProbe: haveMutex,
+        noReclaim: haveMutex,
       },
     }
 
-    let failure = null
-    for (const want of plan) {
-      const claimed = claimFacet(b, want, { ...ctx, now: Date.now() })
-      if (!claimed.ok) {
-        failure = claimed
-        break
+    // ---- phase 1: inside the shared mutex (scan + create only) ----
+    let mutex = null
+    let degraded = false
+    if (mutexEnabled) {
+      const cap = hasDeadline
+        ? Math.min(MUTEX_WAIT_MS, budgetLeft())
+        : Math.min(MUTEX_NO_DEADLINE_WAIT_MS, budgetLeft())
+      mutex = enterMutex(b, {
+        waitMsCap: cap,
+        mutexMode: options.mutexMode,
+        // F3.6 (task-13): a caller with NO deadline escalates its mutex wait while
+        // the mutex shows forward progress (live holder) instead of degrading the
+        // acquire to an unprotected run. The ceiling is clamped to this caller's own
+        // remaining overall budget, so an escalated wait can never overrun
+        // ACQUIRE_DEADLINE_MS. Queue callers already hold min(MUTEX_WAIT_MS, budget)
+        // and retry within their own loop -- they need no escalation.
+        escalateTo: hasDeadline ? undefined : Math.min(MUTEX_NO_DEADLINE_MAX_MS, Math.max(cap, budgetLeft())),
+      })
+      if (mutex.ok !== true) {
+        if (hasDeadline && budgetLeft() > 0) {
+          // `queue` semantics: a busy MUTEX is not a conflict. Keep trying inside the
+          // caller's own budget instead of reporting a conflict for a resource that may
+          // be completely free.
+          sleepSync(Math.min(budgetLeft(), MUTEX_POLL_MS))
+          continue
+        }
+        // No budget to wait (fail-fast, or a caller with no deadline). Dropping the
+        // request here is what turned "slow" into "lost": the observed failure had
+        // `conflicts: []` -- nothing was contending, we simply could not get in.
+        // Degrade instead: run the attempt WITHOUT the mutex (the pre-mutex behaviour,
+        // including its inline liveness judgement) and let the post-commit verification
+        // below catch a late non-participant writer. Guarantee degrades, request survives.
+        // F3.6 (task-13): make the degrade observable with its cause -- a fail-fast
+        // caller asked for it, while a no-deadline caller only lands here after its
+        // escalation ceiling (clamped to the overall budget) was exhausted.
+        mutexTrace('mutex-degrade', { code: mutex.code ?? null, waitedMs: mutex.waitedMs ?? null, failFast: options.mutexMode === 'fail-fast', hasDeadline })
+        degraded = true
+        mutex = null
       }
-      acquired.push(claimed.entry)
-      ctx.claimedPaths = acquired.map((entry) => entry.lockPath)
+    }
+    haveMutex = mutexEnabled && mutex !== null && mutex.ok === true
+    // Holding the mutex makes us the one process that can declare a marker abandoned.
+    // Without this, one crashed multi-facet create would disable the prefilter forever.
+    if (haveMutex) {
+      try { purgeStalePending(b) } catch { /* housekeeping only */ }
+    }
+    // ctx.options was built BEFORE the mutex was acquired, so a plain `noProbe: haveMutex`
+    // captured `false` and phase 1 kept judging liveness inline (violating R3). Fill the
+    // phase-1 rules in now that we know whether we are inside the critical section.
+    ctx.options.noProbe = haveMutex
+    ctx.options.noReclaim = haveMutex
+    ctx.options.procStartOf = haveMutex ? budgetedProcStartOf : (options.procStartOf ?? readProcStart)
+
+    let failure = null
+    let lost = null
+    let committed = false
+    let expiresAt = now + ttlMs
+    let primary = null
+    try {
+      // Verify ① right after entering: a TTL takeover between `enterMutex` returning and
+      // this read would otherwise go unnoticed. Nothing has been created yet, so there
+      // is nothing to undo.
+      let enterVerified = !haveMutex || holdsMutex(b, mutex, { phase: 'enter-verify' })
+      if (haveMutex && !enterVerified) {
+        // F3.3: one-shot grace. A takeover dance that was REJECTED (live owner) parks
+        // the mutex file for 1-18 ms (rename aside -> read back -> rename home), and a
+        // verify landing in that park window reads null. Nothing has been created yet,
+        // so waiting once and re-reading is safe: if the file came back with OUR id we
+        // really hold the mutex again; if it shows anyone else's id (a true steal or
+        // the overwrite variant) we lose exactly as before. commit-verify below has
+        // NO grace -- it is the last gate before the commit write.
+        sleepSync(MUTEX_VERIFY_GRACE_MS)
+        enterVerified = holdsMutex(b, mutex, { phase: 'enter-verify-grace' })
+        mutexTrace('verify-grace', { phase: 'enter-verify', survived: enterVerified, waitedMs: MUTEX_VERIFY_GRACE_MS })
+      }
+      if (haveMutex && !enterVerified) {
+        lost = { phase: 'enter-verify', released: [] }
+      } else {
+        // MD: mark the lease in-flight BEFORE its first facet file, so any concurrent
+        // scanner can tell that our file set is incomplete (see PENDING_DIR).
+        writePending(b, id)
+        // If somebody else is mid-create (degraded path, or a crash residue), their file
+        // set may be partial, so the name prefilter cannot be trusted for this pass.
+        ctx.options.prefilterSafe = foreignPending(b, id).length === 0
+        for (const want of plan) {
+          const claimed = claimFacet(b, want, { ...ctx, now: Date.now() })
+          if (!claimed.ok) {
+            failure = claimed
+            break
+          }
+          acquired.push(claimed.entry)
+          ctx.claimedPaths = acquired.map((entry) => entry.lockPath)
+        }
+
+        if (!failure) {
+          primary = acquired[0]
+          expiresAt = now + ttlMs
+          const record = {
+            id,
+            key: primary ? (plan[0]?.keys?.[0] ?? primary.facet) : facets[0],
+            owner: owner.agent,
+            pid: owner.pid,
+            path: primary ? primary.lockPath : '',
+            version: 2,
+            session: owner.session ?? null,
+            host: owner.host,
+            procStart: owner.procStart ?? null,
+            reason,
+            mode: primary ? primary.mode : 'exclusive',
+            slots: primary ? primary.slots : 1,
+            createdAt: now,
+            expiresAt,
+            paths: acquired.map((entry) => entry.lockPath),
+            facets,
+            entries: acquired,
+          }
+
+          // Verify ② IMMEDIATELY before the commit write, with nothing in between: the
+          // only thing after this check is the single index fs write. That shrinks the
+          // "deprived but still committing" window from the whole critical section
+          // (22-46 ms, or seconds if suspended) down to one small file write.
+          if (haveMutex && !holdsMutex(b, mutex, { phase: 'commit-verify' })) {
+            lost = { phase: 'commit-verify', released: rollback(b, acquired, id).released }
+          } else {
+            registerLeaseRecord(b, record)
+            committed = true
+          }
+        }
+      }
+    } finally {
+      // The marker goes away only once this attempt's file set is complete OR rolled
+      // back, and it goes away BEFORE the mutex is released: a scanner that acquires the
+      // mutex afterwards must see "no marker" meaning "that lease is whole".
+      try { clearPending(b, id) } catch { /* a leftover marker is only a slow-path cost */ }
+      if (haveMutex) exitMutex(b, mutex)
     }
 
-    if (!failure) {
-      // Post-acquisition double-check (§3.1 ancestor/descendant case): two processes
-      // that spell one resource differently can both pass the pre-scan on a file
-      // layout that only distinguishes EXACT facets, then create two files. Comparing
-      // the finished set against every other live lease closes that window: whoever
-      // sees the other one retreats, so a double hold cannot survive even though the
-      // loser may have to retry (fail) instead of winning.
+    // ---- lost the mutex while working: never report success ----
+    if (lost !== null) {
+      if (lost.phase === 'enter-verify') rollback(b, acquired, id)
+      return {
+        ok: false,
+        code: 'MUTEX_LOST',
+        phase: lost.phase,
+        message: 'lost the acquire mutex before commit (a TTL takeover does not notify the '
+          + 'previous holder); everything created in this attempt was rolled back',
+        conflicts: [],
+        released: lost.released,
+        kept: [],
+        facets,
+        strategy,
+        waitedMs: elapsed(),
+      }
+    }
+
+    if (failure === null && committed) {
+      // ---- post-acquisition double-check, OUTSIDE the mutex (it probes) ----
       const rivals = findRivals(b, id, acquired, { ...ctx, now: Date.now() })
-      if (rivals.length > 0) {
-        const undone = rollback(b, acquired, id)
-        lastFailure = { conflicts: rivals, released: undone.released, kept: undone.kept }
-      } else {
-        const expiresAt = now + ttlMs
-        const primary = acquired[0]
-        const record = {
-          id,
-          key: primary ? (plan[0]?.keys?.[0] ?? primary.facet) : facets[0],
-          owner: owner.agent,
-          pid: owner.pid,
-          path: primary ? primary.lockPath : '',
-          version: 2,
-          session: owner.session ?? null,
-          host: owner.host,
-          procStart: owner.procStart ?? null,
-          reason,
-          mode: primary ? primary.mode : 'exclusive',
-          slots: primary ? primary.slots : 1,
-          createdAt: now,
-          expiresAt,
-          paths: acquired.map((entry) => entry.lockPath),
-          facets,
-          entries: acquired,
+      if (rivals.length === 0) {
+        // ---- post-COMMIT verification: are the files I just wrote still mine? ----
+        //
+        // The mutex protects participants, and findRivals catches opponents that were
+        // already on disk when it ran. Neither covers the third hole: a NON-participant
+        // (old plugin version, an external tool, a hand-written file) that writes a
+        // clashing facet AFTER findRivals has finished. Measured independently: when the
+        // opponent's file appeared 12 ms after the scan, BOTH the CLI-shaped arm and the
+        // normal-metadata arm went 4/4 -- no metadata shape can see a file that is not
+        // there yet, so `findRivals` cannot fix this half.
+        //
+        // So before claiming success we re-read every facet file we just created and
+        // check it still carries OUR lease id. If somebody took one over in the meantime,
+        // we roll back and report instead of handing the caller a lease we do not have.
+        //
+        // NOT atomic: an opponent could still write between this check and the return.
+        // Same honesty as BLOCK #4 -- the window shrinks to "N small reads", it does not
+        // become zero (see DESIGN §11).
+        const lostFacets = []
+        for (const entry of acquired) {
+          const onDisk = b.read(entry.lockPath)
+          if (onDisk === null || onDisk.id !== id) {
+            lostFacets.push({ facet: entry.facet, lockPath: entry.lockPath, onDiskId: onDisk === null ? null : (onDisk.id ?? null) })
+          }
         }
-        registerLeaseRecord(b, record)
+        if (lostFacets.length > 0) {
+          const undone = rollback(b, acquired, id)
+          removeLeaseRecord(b, id)
+          return {
+            ok: false,
+            code: 'COMMIT_UNVERIFIED',
+            message: 'a facet created by this acquire was no longer ours at commit time '
+              + '(a non-participant writer took it over); every facet of this attempt was rolled back',
+            lostFacets,
+            conflicts: [],
+            released: undone.released,
+            kept: undone.kept,
+            facets,
+            strategy,
+            waitedMs: elapsed(),
+            mutex: { enabled: mutexEnabled, lost: false },
+          }
+        }
         return {
           ok: true,
           id,
           facets,
           entries: acquired.map((entry) => ({ ...entry })),
-          key: record.key,
+          key: primary ? (plan[0]?.keys?.[0] ?? primary.facet) : facets[0],
           mode: primary ? primary.mode : 'exclusive',
           owner,
           reason,
           createdAt: now,
           expiresAt,
           released: [],
+          mutex: { enabled: haveMutex, degraded },
         }
       }
-    } else {
       const undone = rollback(b, acquired, id)
-      lastFailure = {
-        conflicts: [failure.conflict],
-        released: undone.released,
-        kept: undone.kept,
+      removeLeaseRecord(b, id)
+      lastFailure = { conflicts: rivals, released: undone.released, kept: undone.kept }
+    } else if (failure !== null) {
+      const undone = rollback(b, acquired, id)
+      lastFailure = { conflicts: [failure.conflict], released: undone.released, kept: undone.kept }
+    }
+
+    // ---- phase 2: judge liveness OUTSIDE the mutex, then re-enter and re-scan ----
+    // Only blockers PROVEN dead (`=== false`) may be reclaimed; anything unproven stays a
+    // real conflict (fail-closed). The cheap tiers of isOwnerAlive are never budget-gated,
+    // so a dead lease is still collectable on a tiny budget.
+    let reclaimed = 0
+    if (haveMutex || degraded) {
+      for (const row of lastFailure.conflicts) {
+        // The reclaim decision must be made from the FILE ON DISK, never from the
+        // display fields of a conflict row. `heldBy.pid === null` only means "the
+        // blocker's body carried no pid to show" -- which is exactly what a 0-byte
+        // crashed residue looks like. Using it as a gate made every such residue
+        // unreclaimable: a net regression against the pre-mutex build and a direct
+        // violation of G3. `isOwnerAlive` already answers "unknown" for a pid-less body,
+        // and the unreadable-body branch below handles the empty case by file age.
+        const blockerPath = row.lockPath ?? null
+        if (blockerPath === null) {
+          probeStats.skipReasons.push({ facet: row.facet, why: 'skip:no-path' })
+          continue
+        }
+        const meta = b.read(blockerPath)
+        if (meta === null) {
+          // "Cannot read" is NOT "does not exist": a half-written body is what a LIVE
+          // writer looks like for a few milliseconds. Only a residue that has aged past
+          // the grace window may be collected (the same rule reclaimLock applies).
+          const st = b.stat(blockerPath)
+          if (st === null) {
+            probeStats.skipReasons.push({ facet: row.facet, why: 'skip:gone' })
+            continue
+          }
+          if (Date.now() - st.mtimeMs < MUTEX_TAKEOVER_GRACE_MS) {
+            probeStats.skipReasons.push({ facet: row.facet, why: 'skip:unreadable-fresh (possible live writer)' })
+            continue // fail-closed: treat as a real conflict
+          }
+          if (reclaimLock(b, blockerPath, { ...options, meta: null }).reclaimed) {
+            reclaimed += 1
+            break
+          }
+          probeStats.skipReasons.push({ facet: row.facet, why: 'skip:cas-lost (unreadable residue)' })
+          continue
+        }
+        const alive = isOwnerAlive(meta, {
+          now: Date.now(),
+          host: options.host,
+          pidExists: options.pidExists,
+          // RECLAIM decision: at most one probe per attempt, gated only by the overall
+          // deadline -- never by the enumeration gates (see reclaimProcStartOf).
+          procStartOf: reclaimProcStartOf,
+          procStartToleranceMs: options.procStartToleranceMs,
+        })
+        if (alive !== false) {
+          probeStats.skipReasons.push({ facet: row.facet, why: `skip:alive-or-unknown (alive=${String(alive)})` })
+          continue
+        }
+        probeStats.dead += 1
+        if (reclaimLock(b, blockerPath, { ...options, meta }).reclaimed) {
+          reclaimed += 1
+          break // one collected lease is enough: we are going to re-scan anyway
+        }
+        probeStats.skipReasons.push({ facet: row.facet, why: 'skip:cas-lost' })
       }
     }
 
-    const remaining = deadline - Date.now()
-    if (strategy === 'fail' || remaining <= 0) {
+    if (reclaimed > 0) {
+      reentries += 1
+      if (reentries > MAX_REENTRY_ATTEMPTS) {
+        return {
+          ok: false,
+          code: 'REENTRY_EXCEEDED',
+          message: `gave up after ${MAX_REENTRY_ATTEMPTS} re-entries (probes=${probesUsed})`,
+          conflicts: lastFailure.conflicts,
+          released: lastFailure.released,
+          kept: lastFailure.kept,
+          facets,
+          strategy,
+          waitedMs: elapsed(),
+        }
+      }
+      continue // re-enter the mutex and re-scan from scratch
+    }
+
+    // No progress possible: this is a real conflict (or the queue deadline is up).
+    if (hasDeadline && budgetLeft() >= ACQUIRE_DEADLINE_MS) {
       return {
         ok: false,
+        code: 'ACQUIRE_DEADLINE_EXCEEDED',
+        message: `acquire used ${elapsed()} ms (budget ${ACQUIRE_DEADLINE_MS} ms, probes=${probesUsed})`,
         conflicts: lastFailure.conflicts,
         released: lastFailure.released,
         kept: lastFailure.kept,
         facets,
         strategy,
-        waitedMs: waitMs - Math.max(0, remaining),
+        waitedMs: elapsed(),
+      }
+    }
+
+    const left = hasDeadline ? budgetLeft() : 0
+    if (strategy === 'fail' || left <= 0) {
+      return {
+        ok: false,
+        code: 'CONFLICT',
+        conflicts: lastFailure.conflicts,
+        released: lastFailure.released,
+        kept: lastFailure.kept,
+        facets,
+        strategy,
+        waitedMs: elapsed(),
+        mutex: { enabled: mutexEnabled },
       }
     }
     // Queue: back off, but never sleep past the deadline.
-    sleepSync(Math.min(remaining, 50))
+    sleepSync(Math.min(left, 50))
   }
 }
 
@@ -2469,27 +3830,82 @@ export function acquireMany(backend, requests, options = {}) {
 function findRivals(backend, id, acquired, ctx) {
   const rivals = []
   const seen = new Set()
-  for (const entry of backend.list()) {
+  const wantedFacets = acquired.map((entry) => entry.facet)
+  const candidates = typeof backend.list === 'function'
+    ? backend.list({ forFacets: wantedFacets, prefilterSafe: ctx.options.prefilterSafe !== false })
+    : backend.list()
+  for (const entry of candidates) {
     const meta = entry.meta
-    if (meta === null || meta.id === id) continue
+    if (meta === null) {
+      // Same rule as findFacetConflict: an unreadable body is not proof of absence. A
+      // FRESH one may be a live writer whose facets we cannot inspect, so we must retreat
+      // (fail-closed) rather than assume it is nothing. An aged residue is crashed
+      // garbage and may be ignored -- it cannot be holding anything.
+      const st = backend.stat(entry.path)
+      if (st !== null && ctx.now - st.mtimeMs < MUTEX_TAKEOVER_GRACE_MS) {
+        const row = {
+          facet: acquired[0]?.facet ?? '',
+          heldBy: { agent: null, session: null, pid: null, host: null },
+          reason: '',
+          expiresInMs: null,
+          mode: 'exclusive',
+          lockPath: entry.path,
+          observedAtMs: ctx.now,
+          detail: 'unreadable lock file younger than the takeover grace (possible live writer)',
+          livenessRefined: false,
+          livenessVerdict: 'unknown (unreadable body, not judged)',
+        }
+        const fingerprint = `unreadable|${entry.path}`
+        if (!seen.has(fingerprint)) {
+          seen.add(fingerprint)
+          rivals.push(row)
+        }
+      }
+      continue
+    }
+    if (meta.id === id) continue
     const heldFacets = facetsOfMeta(meta)
     if (heldFacets.length === 0) continue
     const heldMode = typeof meta.mode === 'string' ? meta.mode : 'exclusive'
     for (const mine of acquired) {
       for (const heldFacet of heldFacets) {
         if (!facetsClash(mine.facet, mine.mode, heldFacet, heldMode)) continue
-        if (isOwnerAlive(meta, {
+        // FAIL-CLOSED (was: `!== true` -> continue, i.e. fail-OPEN).
+        //
+        // `isOwnerAlive` returns a TRI-STATE: true / false / null. The old rule skipped
+        // the rival on both `false` AND `null`, so an UNKNOWN holder was silently
+        // ignored. That is not a corner case: the CLI writes `pidGated:false` on purpose
+        // (`lease.ps1:1070, 1303`), which makes `isOwnerAlive` return null
+        // (`lock.js` pidGated branch), so the plugin was BLIND to CLI holders during the
+        // post-check and did not retreat -- cross-tool double-hold, measured
+        // independently (injection: 17/20 both-win; real plugin-vs-CLI: 1/30).
+        //
+        // Only PROVEN death (`=== false`) may skip a rival now. `null` counts as a rival.
+        // That cannot cause a mutual-retreat deadlock between participants: participants
+        // create facets inside the mutex, so the later one fails in phase 1 and never
+        // reaches this post-check. The `null` sources (CLI, cross-host, pid-less v0
+        // files) never retreat themselves, so counting them as rivals means the plugin
+        // simply yields -- "CLI wins, plugin steps aside", never both-lose.
+        const liveness = isOwnerAlive(meta, {
           now: ctx.now,
           host: ctx.options.host,
           pidExists: ctx.options.pidExists,
           procStartOf: ctx.options.procStartOf,
           procStartToleranceMs: ctx.options.procStartToleranceMs,
-        }) !== true) continue
+        })
+        if (liveness === false) continue
         const row = conflictRow(mine.facet, meta, ctx.now)
         const fingerprint = `${row.facet}|${row.heldBy.pid}|${row.mode}`
         if (seen.has(fingerprint)) continue
         seen.add(fingerprint)
-        rivals.push(row)
+        // Observable: did we actually refine the verdict with a PID-reuse check, or did
+        // we fall back to "cannot prove dead -> treat as alive"? The two look identical
+        // in `heldBy`, and operators need to tell them apart.
+        rivals.push({
+          ...row,
+          livenessRefined: ctx.probeStats ? ctx.probeStats.refined > 0 : false,
+          livenessVerdict: liveness === true ? 'alive' : 'unknown (not proven dead; treated as alive)',
+        })
       }
     }
   }

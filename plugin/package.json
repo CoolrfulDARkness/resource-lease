@@ -1,6 +1,6 @@
 {
   "name": "dsh-resource-lease",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Resource lease arbitration for agents sharing one machine: a Host service, three tools, runtime context and a tool guard, on lock files shared with the resource-lease CLI.",
   "type": "module",

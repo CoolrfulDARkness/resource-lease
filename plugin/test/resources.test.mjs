@@ -626,9 +626,13 @@ test('findConflicts reports every colliding facet pair (for §4.3 diagnostics)',
   assert.deepEqual(findConflicts(held, [], aliases), [], 'an empty side has no conflicts')
 
   // The held profile collides with the directory through the shared path facet,
-  // including with a differently-spelled request for the same directory.
+  // including with a differently-spelled request for the same directory. Since
+  // the §11.7-② fix facetsConflict expands both arguments, so the profile's OWN
+  // facet now also reports its real (kernel-confirmed) conflict with the
+  // directory, alongside the materialised path-vs-path pair.
   const clash = toEntries(expandFacets('path:C:/Users/X/AppData/Local/Google/Chrome/User Data', aliases))
   assert.deepEqual(findConflicts(held, clash, aliases), [
+    { facet: 'browser:profile:work', otherFacet: PROFILE_DIR_CANONICAL },
     { facet: PROFILE_DIR_CANONICAL, otherFacet: PROFILE_DIR_CANONICAL },
   ])
 

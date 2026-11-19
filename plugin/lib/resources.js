@@ -1183,6 +1183,14 @@ export function normalizeMode(mode) {
 /**
  * Whether two modes may coexist on one facet. §3.2 exempts exactly shared+shared.
  *
+ * R-1 CAVEAT (do not remove): this answers the MODEL's intent question only. The
+ * lock KERNEL's claim layer implements `shared` as the same single O_EXCL
+ * `<key>.lock` file the CLI uses -- two shared holders of one facet DO conflict
+ * on disk, even though this predicate (and therefore facetsConflict()) says
+ * compatible. Multi-holder coexistence exists only as `pool` + slot files.
+ * Callers that need "will the kernel admit both?" must not rely on this
+ * predicate for shared pairs; see plugin README "Modes" (shared vs pool).
+ *
  * Note for pool callers: capacity is NOT modelled here. Two `pool` holders of one
  * facet DO conflict per the literal §3.2 formula, which is why slot allocation
  * must be decided by slot files in lock.js and never by this predicate alone.
@@ -1217,7 +1225,22 @@ function modesCompatible(modeA, modeB) {
  * @param {{ base?: string }} [options] parse options.
  * @returns {boolean} true when holding both is a violation.
  */
-export function facetsConflict(facetA, modeA, facetB, modeB, options = {}) {
+/**
+ * The RAW facet-level conflict predicate: compares exactly the two facets given,
+ * with no expansion. This is what the lock kernel uses internally, because its
+ * inputs are always already-expanded facets -- expandFacets() materialises every
+ * cross-class implication (browser:cdp:<p> -> port:<p>, browser:profile:<id> ->
+ * its directory path facets) as extra facets up front, so a raw comparison is
+ * both correct and cheapest there.
+ *
+ * @param {string | object} facetA facet A holds or wants.
+ * @param {string} modeA A's mode.
+ * @param {string | object} facetB facet B holds or wants.
+ * @param {string} modeB B's mode.
+ * @param {{ base?: string }} [options] parse options.
+ * @returns {boolean} true when holding both is a violation.
+ */
+export function rawFacetsConflict(facetA, modeA, facetB, modeB, options = {}) {
   const opts = optionsFrom(options)
   const a = asFacet(facetA, opts)
   const b = asFacet(facetB, opts)
@@ -1228,6 +1251,55 @@ export function facetsConflict(facetA, modeA, facetB, modeB, options = {}) {
   if (a.class !== b.class) return false
   const entry = a.known ? CLASSES[a.class] : OPAQUE_CLASS
   return entry.subjectsConflict(a, b, opts)
+}
+
+/**
+ * The facet-level conflict predicate callers can use directly.
+ *
+ * SEMANTICS CHANGE (§11.7-② fix, and the reason it is safe): the previous version
+ * compared the two arguments WITHOUT expansion, so it answered "do these two
+ * spellings clash" with false whenever the clash came from a cross-class
+ * implication -- `facetsConflict('browser:profile:work', ..., 'path:C:/.../User
+ * Data', ...)` returned false even with the profile's directory alias configured,
+ * while a real acquire over the same pair is blocked (the kernel expands before
+ * comparing). A predicate that gives a confident wrong answer is worse than a
+ * missing one, so this function now runs BOTH arguments through expandFacets()
+ * first -- the same expansion the kernel does -- and reports whether ANY expanded
+ * facet pair clashes. For already-expanded inputs (the kernel's own usage, and
+ * plain path:/port: facets) expansion is idempotent, so results are unchanged
+ * there; for raw browser:* inputs the answer now matches real acquire behaviour.
+ *
+ * @param {string | object} facetA facet A holds or wants (any facet spelling).
+ * @param {string} modeA A's mode.
+ * @param {string | object} facetB facet B holds or wants (any facet spelling).
+ * @param {string} modeB B's mode.
+ * @param {{ base?: string }} [options] parse options.
+ * @returns {boolean} true when holding both is a violation.
+ */
+export function facetsConflict(facetA, modeA, facetB, modeB, options = {}) {
+  const opts = optionsFrom(options)
+  const expand = (facet) => {
+    if (typeof facet === 'string') {
+      // Invalid keys throw here -- the same contract as the old asFacet() call,
+      // which also parsed before the mode check.
+      const value = expandFacets(facet, opts)
+      return Array.isArray(value) && value.length > 0 ? value : [facet]
+    }
+    // Already-parsed facet object: expand its canonical spelling when it has one,
+    // otherwise compare it raw (the old asFacet() pass-through behaviour).
+    const canonical = facet !== null && typeof facet === 'object' && typeof facet.canonical === 'string'
+      ? facet.canonical
+      : null
+    if (canonical === null) return [facet]
+    const value = expandFacets(canonical, opts)
+    return Array.isArray(value) && value.length > 0 ? value : [facet]
+  }
+  for (const a of expand(facetA)) {
+    for (const b of expand(facetB)) {
+      if (rawFacetsConflict(a, modeA, b, modeB, opts)) return true
+    }
+  }
+  return false
 }
 
 /**

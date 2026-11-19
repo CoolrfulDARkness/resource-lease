@@ -95,6 +95,7 @@ const backend = localBackend(plan.lockRoot)
 const owner = plan.ownerName ? { agent: plan.ownerName, session: 'sess-' + plan.ownerName } : undefined
 
 let result
+const tAcquireStart = Date.now()
 try {
   if (plan.startAt) {
     while (Date.now() < plan.startAt) { /* barrier: all racers fire together */ }
@@ -109,9 +110,16 @@ try {
 } catch (err) {
   result = { ok: false, error: String((err && err.stack) || err) }
 }
+const tAcquireEnd = Date.now()
 
 result.pid = process.pid
 result.procStart = Math.round(Date.now() - process.uptime() * 1000)
+// When this process's acquire() RETURNED. For a loser this is the instant the conflict was
+// computed (the kernel stamps expiresInMs from the same Date.now() in the same tick), which
+// is what lets a test DERIVE the remaining TTL instead of assuming "the loser acted within
+// N seconds of the winner".
+result.tAcquireStart = tAcquireStart
+result.tAcquireEnd = tAcquireEnd
 if (plan.ownerName) result.ownerName = plan.ownerName
 fs.writeFileSync(outFile, JSON.stringify(result))
 
@@ -299,8 +307,14 @@ test('§11 #1 two real processes racing for path:D:/out: exactly one wins', { ti
   const root = freshRoot()
   const key = 'path:D:/out'
   const startAt = Date.now() + 700 // barrier: both children fire at the same instant
-  const a = launch({ lockRoot: root, requests: [key], ttlMs: 30_000, reason: 'race a', startAt, ownerName: 'racer-a' })
-  const b = launch({ lockRoot: root, requests: [key], ttlMs: 30_000, reason: 'race b', startAt, ownerName: 'racer-b' })
+  // holdMs is NOT optional here: without it the winner acquires and exits immediately, so
+  // the race being measured is "whoever exits first", not mutual exclusion. §5/G3 says a
+  // dead holder's lease IS reclaimable at once, so a loser that reclaims after the winner
+  // exited is CORRECT behaviour -- asserting "exactly one winner" over that window tests a
+  // promise the kernel never made. With a hold, both attempts really overlap and the
+  // assertion measures what it means to measure.
+  const a = launch({ lockRoot: root, requests: [key], ttlMs: 30_000, reason: 'race a', startAt, ownerName: 'racer-a', holdMs: 3000 })
+  const b = launch({ lockRoot: root, requests: [key], ttlMs: 30_000, reason: 'race b', startAt, ownerName: 'racer-b', holdMs: 3000 })
 
   const [resultA, resultB] = await Promise.all([a.readResult(), b.readResult()])
   await Promise.all([a.finished, b.finished])
@@ -334,7 +348,57 @@ test('§11 #1 two real processes racing for path:D:/out: exactly one wins', { ti
   assert.equal(conflict.heldBy.host, hostname())
   assert.equal(conflict.mode, 'exclusive')
   assert.equal(conflict.reason, winner.reason)
-  assert.ok(conflict.expiresInMs > 20_000, `remaining ttl reported: ${conflict.expiresInMs}`)
+
+  // The remaining TTL must be the REAL number, derived -- not just "a big number".
+  //
+  // This replaces `assert.ok(conflict.expiresInMs > 20_000)`, which conflated two
+  // unrelated things: whether the TTL is reported correctly, and how fast the loser
+  // happened to try. It silently required the loser to attempt within 10 s of the
+  // winner's acquire -- a timing premise the kernel never promised, and one that 32-way
+  // CPU load breaks on a correct implementation.
+  //
+  // WHERE THE KERNEL'S NUMBER COMES FROM (lock.js:2373 stamps `now` per facet claim, and
+  // the conflict row's expiresInMs is `expiresAt - now`, built after the conflict scan and
+  // its liveness probe): the stamp is taken somewhere INSIDE the loser's own acquire, so
+  // the reported TTL must lie in [expiresAt - tAcquireEnd, expiresAt - tAcquireStart].
+  // Deriving it from that window -- rather than from one endpoint -- is what makes this an
+  // exact check instead of a magnitude proxy, and it stays correct when a loaded machine
+  // spends seconds in the pid probe.
+  //
+  // What is checked, and why it is strictly stronger than the old line:
+  //   * > 0                      : still live when reported (old had this implicitly)
+  //   * >= expiresAt-tAcquireEnd : cannot UNDER-report the remaining life
+  //   * <= expiresAt-tAcquireStart: cannot OVER-report it
+  //   * <= ttlMs + window + slack: never claims more life than the lease ever had
+  // The old `> 20_000` never checked the value against the lease at all; it only checked
+  // that a biggish number appeared, which a wrong-but-large number would also satisfy.
+  const ttlMs = 30_000
+  const clockSlackMs = 2000
+  const loserWindowMs = loser.tAcquireEnd - loser.tAcquireStart
+  assert.equal(typeof winner.expiresAt, 'number', `the winner result must carry expiresAt; got ${JSON.stringify(winner.expiresAt)}`)
+  assert.equal(typeof loser.tAcquireStart, 'number', `the loser must report when its acquire began; got ${JSON.stringify(loser.tAcquireStart)}`)
+  assert.equal(typeof loser.tAcquireEnd, 'number', `the loser must report when its acquire returned; got ${JSON.stringify(loser.tAcquireEnd)}`)
+
+  const remainingAtLoserEnd = winner.expiresAt - loser.tAcquireEnd
+  const remainingAtLoserStart = winner.expiresAt - loser.tAcquireStart
+  assert.ok(conflict.expiresInMs > 0, `the reported TTL must still be live: ${conflict.expiresInMs}`)
+  assert.ok(
+    conflict.expiresInMs >= remainingAtLoserEnd - clockSlackMs,
+    `expiresInMs (${conflict.expiresInMs}) under-reports the remaining TTL: it must be >= `
+    + `winner.expiresAt - loser.tAcquireEnd (${winner.expiresAt} - ${loser.tAcquireEnd} = ${remainingAtLoserEnd}) `
+    + `minus ${clockSlackMs}ms`,
+  )
+  assert.ok(
+    conflict.expiresInMs <= remainingAtLoserStart + clockSlackMs,
+    `expiresInMs (${conflict.expiresInMs}) over-reports the remaining TTL: it must be <= `
+    + `winner.expiresAt - loser.tAcquireStart (${winner.expiresAt} - ${loser.tAcquireStart} = ${remainingAtLoserStart}) `
+    + `plus ${clockSlackMs}ms`,
+  )
+  assert.ok(
+    conflict.expiresInMs <= ttlMs + loserWindowMs + clockSlackMs,
+    `expiresInMs (${conflict.expiresInMs}) cannot exceed the lease TTL (${ttlMs}) by more than `
+    + `the loser's own sampling window (${loserWindowMs}ms) and ${clockSlackMs}ms of clock slack`,
+  )
 
   // No residue from the loser: nothing was acquired before it lost, and nothing leaked.
   assert.deepEqual(loser.released, [])
@@ -351,6 +415,9 @@ test('§11 #1 four real processes racing for one facet: still exactly one holder
     reason: `racer ${n}`,
     startAt,
     ownerName: `racer-${n}`,
+    // Same reason as the two-racer case above: the winner must still be alive while the
+    // others try, otherwise this measures exit timing instead of exclusion (G3).
+    holdMs: 3000,
   }))
   const results = await Promise.all(racers.map((racer) => racer.readResult()))
   await Promise.all(racers.map((racer) => racer.finished))
@@ -376,6 +443,10 @@ test('§11 #6 two processes request A,B in opposite order: no deadlock, one all-
     reason: 'A then B',
     startAt,
     ownerName: 'order-forward',
+    // Same reason as §11 #1: without a hold the winner acquires and exits immediately, so
+    // the other racer's takeover is LEGAL under §5/G3 and the race measures exit timing
+    // instead of exclusion. Both attempts must really overlap.
+    holdMs: 3000,
   })
   const reverse = launch({
     lockRoot: root,
@@ -384,6 +455,7 @@ test('§11 #6 two processes request A,B in opposite order: no deadlock, one all-
     reason: 'B then A',
     startAt,
     ownerName: 'order-reverse',
+    holdMs: 3000,
   })
 
   const [resultForward, resultReverse] = await Promise.all([forward.readResult(), reverse.readResult()])
@@ -701,7 +773,10 @@ test('§11 #12 pool slots=2 with three real processes: exactly two win, one slot
     requests: request,
     ttlMs: 30_000,
     startAt,
-    holdMs: 600,
+    // 600ms was too short: under load the two winners were gone before the third racer
+    // even looked, so it legitimately collected a dead slot (§5/G3) and the pool appeared
+    // to admit three. The hold must outlast the whole race.
+    holdMs: 3000,
     reason: `pool ${name}`,
     ownerName: name,
   }))

@@ -290,6 +290,10 @@ function normalizeConfig(raw, warn = () => {}) {
   }
 
   return {
+    // H3 kill switch. Default ON: the shared acquire mutex is what closes the
+    // ancestor/range/cross-class scan+create window. Turning it off is an escape hatch
+    // for a wedged deployment, never a supported mode -- the kernel reports it loudly.
+    globalMutex: c.globalMutex !== false,
     enabled: c.enabled !== false,
     lockRoot: typeof c.lockRoot === 'string' && c.lockRoot.trim() !== '' ? c.lockRoot.trim() : lock.defaultLockRoot(),
     defaultTtlMs,
@@ -393,6 +397,16 @@ export function apply(ctx, config) {
   // are reported through the host's logger instead of vanishing.
   const log = makeLogger(ctx)
   const cfg = normalizeConfig(config, (message) => log.warn(message))
+  // H3 kill switch: turning the shared acquire mutex OFF must be LOUD, never silent.
+  // With it off, two agents can both win the ancestor/range/cross-class case (path:a and
+  // path:a/sub touch different files), which is exactly the hole the mutex closes. This
+  // is an escape hatch for a wedged deployment, not a supported mode.
+  if (cfg.globalMutex === false) {
+    log.warn('resource-lease: globalMutex is DISABLED. Acquire no longer takes the shared '
+      + "'_global.lock' mutex, so the ancestor/range/cross-class scan+create window is OPEN: "
+      + 'two agents can both win path:a and path:a/sub. resource_status reports this as '
+      + 'degraded; this is not a supported mode.')
+  }
   if (!cfg.enabled) return
 
   /** Leases this process holds: lease id -> metadata. */
@@ -411,6 +425,16 @@ export function apply(ctx, config) {
   const backend = lock.localBackend(cfg.lockRoot, {
     warn: (message) => log.warn(message),
   })
+
+  // Route the lock kernel's model warnings (degradation, invalid keys, and the
+  // §11.7-① "acquired WITHOUT full protection" coverage gap) into this plugin's
+  // own logger. Without this they fall back to process.emitWarning -> stderr,
+  // which the MCP stdio path buries in host logs agents never read.
+  try {
+    lock.setModelWarningSink((message) => log.warn(message))
+  } catch {
+    /* warning routing is best effort */
+  }
 
   // Install the alias table (§3.3.1) before anything can expand a key. The
   // resource model keeps it as module state, so the lock kernel's facetsOf()
@@ -797,6 +821,10 @@ export function apply(ctx, config) {
       owner: lock.currentOwner(ownerName),
       strategy,
       waitMs,
+      // Kill switch (H3): globalMutex: false in the plugin config turns the shared
+      // acquire mutex off. The kernel reports mutex.enabled: false on every result, so a
+      // caller can SEE the degraded mode instead of assuming the guarantee still holds.
+      mutex: cfg.globalMutex,
     })
 
     if (result === null || typeof result !== 'object') {
@@ -1126,6 +1154,7 @@ export function apply(ctx, config) {
       schema: outputSchema({
         count: { type: 'number', required: true, description: 'Number of leases listed.' },
         lockRoot: { type: 'string', required: true, description: 'Directory holding the lock files; the CLI must use the same one.' },
+        globalMutex: { type: 'object', required: true, description: 'Whether the shared acquire mutex is in use; enabled:false means DEGRADED (ancestor/range/cross-class window is open).' },
         text: { type: 'string', required: true, description: 'The formatted lease table.' },
       }),
       render: textRender((v) => v.text),
@@ -1142,10 +1171,18 @@ export function apply(ctx, config) {
         const id = row.mine ? `, id ${row.id}` : ''
         return `- ${row.key}: ${describeLease(row, now)}, ${who}${reason}${id}`
       })
+      // H3: the kill switch must be visible here, not only in the log. An operator who
+      // reads status must be able to tell "the guarantee is on" from "degraded".
+      const mutex = cfg.globalMutex === false
+        ? { enabled: false, mode: 'degraded', warning: 'no acquire mutex: the ancestor/range/cross-class scan+create window is OPEN' }
+        : { enabled: true, mode: 'enforced' }
+      const degradedBanner = mutex.enabled === true
+        ? ''
+        : 'WARNING: DEGRADED MODE - the shared acquire mutex is DISABLED (' + mutex.warning + ').\n\n'
       const text = rows.length === 0
         ? `No live leases${filter === undefined ? '' : ` for "${filter}"`}. Lock root: ${cfg.lockRoot}`
         : `Live resource leases (lock root ${cfg.lockRoot}):\n${lines.join('\n')}`
-      return { count: rows.length, lockRoot: cfg.lockRoot, text }
+      return { count: rows.length, lockRoot: cfg.lockRoot, globalMutex: mutex, text: degradedBanner + text }
     },
   })), 'dsh-resource-lease: tool resource_status')
 
